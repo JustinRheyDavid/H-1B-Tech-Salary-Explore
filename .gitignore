@@ -1,0 +1,36 @@
+# --- Data ---------------------------------------------------------------
+# Raw DOL downloads are 100-200 MB each and must never be committed.
+data/raw/*
+!data/raw/.gitkeep
+
+# Source spreadsheets, wherever they land.
+*.xlsx
+*.xls
+
+# Intermediate Parquet cache - rebuildable from raw, so not tracked.
+data/interim/
+
+# The built SQLite database IS committed on purpose: the deployed
+# Streamlit app reads it directly from the repo. Do not ignore it.
+!data/h1b.db
+
+# --- Python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Editors / OS -------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+~$*
+
+# --- Secrets ------------------------------------------------------------
+.env
+.streamlit/secrets.toml
