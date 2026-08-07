@@ -20,14 +20,14 @@ between fiscal years. Cleaning it is most of the work.
 
 ## Status
 
-Build in progress. Steps 1-3 of 10 complete — see
+Build in progress. Steps 1-4 of 10 complete — see
 [`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md)
 for the full plan.
 
 - [x] 1. Repo skeleton and dependencies
 - [x] 2. Data acquisition
 - [x] 3. Exploration notebook
-- [ ] 4. Cleaning module
+- [x] 4. Cleaning module
 - [ ] 5. Tests
 - [ ] 6. Database schema and loader
 - [ ] 7. Query layer
@@ -92,7 +92,7 @@ one breaks an assumption a reasonable person would make:
 7. **A third of filings give a wage *band*, not a figure.**
    `WAGE_RATE_OF_PAY_TO` is populated on 32% of rows, with a median spread of
    22%. Reading `WAGE_RATE_OF_PAY_FROM` alone understates those salaries by
-   13.7%. This project reports the midpoint and keeps both columns.
+   13.8%. This project reports the midpoint and keeps both columns.
 8. **3,221 filings use the wrong wage unit.** Annual salaries were filed
    against `Hour`, `Week`, `Bi-Weekly`, and `Month`. Left uncorrected the
    maximum annualized wage is $1.47 billion and the mean is $428,938 against a
