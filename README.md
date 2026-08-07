@@ -89,7 +89,11 @@ one breaks an assumption a reasonable person would make:
 6. **FY2026_Q2 is cumulative; the rest are not.** It covers two quarters
    (Oct 2025–Mar 2026) while every other file covers one. Naming alone does
    not tell you this.
-7. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
+7. **A third of filings give a wage *band*, not a figure.**
+   `WAGE_RATE_OF_PAY_TO` is populated on 32% of rows, with a median spread of
+   22%. Reading `WAGE_RATE_OF_PAY_FROM` alone understates those salaries by
+   13.7%. This project reports the midpoint and keeps both columns.
+8. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
    H-1B1 Chile, and H-1B1 Singapore — roughly 3% of rows.
 
 ## Running locally
