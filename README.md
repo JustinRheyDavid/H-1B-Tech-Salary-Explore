@@ -93,7 +93,11 @@ one breaks an assumption a reasonable person would make:
    `WAGE_RATE_OF_PAY_TO` is populated on 32% of rows, with a median spread of
    22%. Reading `WAGE_RATE_OF_PAY_FROM` alone understates those salaries by
    13.7%. This project reports the midpoint and keeps both columns.
-8. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
+8. **3,221 filings use the wrong wage unit.** Annual salaries were filed
+   against `Hour`, `Week`, `Bi-Weekly`, and `Month`. Left uncorrected the
+   maximum annualized wage is $1.47 billion and the mean is $428,938 against a
+   median of $118,248. After repair the mean is $130,848.
+9. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
    H-1B1 Chile, and H-1B1 Singapore — roughly 3% of rows.
 
 ## Running locally
