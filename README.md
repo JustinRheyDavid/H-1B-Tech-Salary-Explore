@@ -20,13 +20,13 @@ between fiscal years. Cleaning it is most of the work.
 
 ## Status
 
-Build in progress. Steps 1-2 of 10 complete — see
+Build in progress. Steps 1-3 of 10 complete — see
 [`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md)
 for the full plan.
 
 - [x] 1. Repo skeleton and dependencies
 - [x] 2. Data acquisition
-- [ ] 3. Exploration notebook
+- [x] 3. Exploration notebook
 - [ ] 4. Cleaning module
 - [ ] 5. Tests
 - [ ] 6. Database schema and loader
