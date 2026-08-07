@@ -20,13 +20,13 @@ between fiscal years. Cleaning it is most of the work.
 
 ## Status
 
-Build in progress. Steps 1-2 of 10 complete — see
+Build in progress. Steps 1-3 of 10 complete — see
 [`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md)
 for the full plan.
 
 - [x] 1. Repo skeleton and dependencies
 - [x] 2. Data acquisition
-- [ ] 3. Exploration notebook
+- [x] 3. Exploration notebook
 - [ ] 4. Cleaning module
 - [ ] 5. Tests
 - [ ] 6. Database schema and loader
@@ -89,7 +89,15 @@ one breaks an assumption a reasonable person would make:
 6. **FY2026_Q2 is cumulative; the rest are not.** It covers two quarters
    (Oct 2025–Mar 2026) while every other file covers one. Naming alone does
    not tell you this.
-7. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
+7. **A third of filings give a wage *band*, not a figure.**
+   `WAGE_RATE_OF_PAY_TO` is populated on 32% of rows, with a median spread of
+   22%. Reading `WAGE_RATE_OF_PAY_FROM` alone understates those salaries by
+   13.7%. This project reports the midpoint and keeps both columns.
+8. **3,221 filings use the wrong wage unit.** Annual salaries were filed
+   against `Hour`, `Week`, `Bi-Weekly`, and `Month`. Left uncorrected the
+   maximum annualized wage is $1.47 billion and the mean is $428,938 against a
+   median of $118,248. After repair the mean is $130,848.
+9. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
    H-1B1 Chile, and H-1B1 Singapore — roughly 3% of rows.
 
 ## Running locally
