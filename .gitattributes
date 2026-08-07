@@ -1,7 +1,0 @@
-# Keep the language bar honest. The exploration notebook is a written-up
-# analysis, not the codebase - counting its JSON would report this as a
-# 97% "Jupyter Notebook" project when the shipped code is Python.
-*.ipynb linguist-documentation
-
-# Notebook JSON diffs are unreadable in review; fold them by default.
-*.ipynb -diff
