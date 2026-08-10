@@ -435,6 +435,16 @@ def stage_counts(
     start = len(frame)
     dropped = n_uncertified + n_untech
     if rows_read is not None:
+        if rows_read < len(frame):
+            # Deduplication only ever removes rows, so a smaller count is the
+            # wrong number — the pre-dedupe total for a different set of files,
+            # or a post-dedupe one passed by mistake. The reconciliation below
+            # cannot catch it: the arithmetic stays consistent and the ledger
+            # balances around a negative.
+            raise ValueError(
+                f"rows_read={rows_read:,} is below the {len(frame):,} rows given; "
+                "it should be the count before ingest.load_all deduplicated"
+            )
         stages["rows read"] = rows_read
         stages["duplicate cases"] = rows_read - len(frame)
         start = rows_read
