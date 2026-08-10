@@ -424,8 +424,10 @@ def stage_counts(
 
     Pass ``cleaned`` if you already hold ``clean(frame)`` — the loader will —
     to avoid running the pipeline a second time purely to count its output.
-    That costs about 530 MB of peak memory on the full dataset. Reconciliation
-    still applies, so a frame that is not this one's output raises.
+    The second run adds about 530 MB while it is alive; how much of that shows
+    up as a lower process peak depends on what else the caller is holding, and
+    was about 200 MB for the test suite. Reconciliation still applies, so a
+    frame that is not this one's output raises.
 
     Returns counts rather than printing them; nothing else here does I/O.
     """

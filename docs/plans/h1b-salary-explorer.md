@@ -155,7 +155,7 @@ This step exists to find the mess *before* writing the cleaner. Do not skip it a
 - `normalize_employer(name) -> str` — uppercase, strip punctuation, collapse whitespace, strip trailing corporate suffixes
 - `normalize_city(city)` / `normalize_state(state)` — title-case city, two-letter uppercase state
 - `flag_outliers(wages)` — mark rather than delete rows outside $10k–$2M annualized; the dashboard filters them, but they stay auditable
-- `stage_counts(df, rows_read=None)` — rows surviving each stage, reconciled against `clean()`
+- `stage_counts(df, tech_only=True, rows_read=None, cleaned=None)` — rows surviving each stage, reconciled against `clean()`; pass `cleaned` if you already hold it, as `load.py` will
 
 Every function is pure: Series or DataFrame in, Series or DataFrame out, no I/O, no globals.
 

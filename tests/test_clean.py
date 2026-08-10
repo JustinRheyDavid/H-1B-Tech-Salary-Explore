@@ -389,6 +389,43 @@ def test_stage_counts_notices_a_filter_it_does_not_know_about(monkeypatch):
         clean.stage_counts(raw())
 
 
+def test_stage_counts_skips_the_pipeline_when_given_its_output(monkeypatch):
+    """The whole point of ``cleaned=``: do not clean 1.3M rows twice.
+
+    Asserting the counts match is not enough — they match either way, so a
+    parameter that silently did nothing would pass. Make calling ``clean``
+    an error instead, which can only be satisfied by actually using the
+    frame that was handed over.
+    """
+    frame = raw(CASE_NUMBER=["a", "b"], CASE_STATUS=["Certified", "Denied"])
+    cleaned = clean.clean(frame)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("clean() ran even though cleaned= was supplied")
+
+    monkeypatch.setattr(clean, "clean", fail)
+    assert clean.stage_counts(frame, cleaned=cleaned)["rows out"] == len(cleaned)
+
+
+def test_stage_counts_reads_the_same_with_or_without_the_cleaned_frame():
+    frame = raw(
+        CASE_NUMBER=["a", "b", "c"],
+        CASE_STATUS=["Certified", "Denied", "Certified"],
+        SOC_CODE=["15-1252", "15-1252", "29-1216"],
+    )
+    pd.testing.assert_series_equal(
+        clean.stage_counts(frame),
+        clean.stage_counts(frame, cleaned=clean.clean(frame)),
+    )
+
+
+def test_stage_counts_rejects_a_cleaned_frame_from_other_data():
+    """Supplying the frame moves the trust to the caller. Verify it anyway."""
+    frame = raw(CASE_NUMBER=["a", "b"])
+    with pytest.raises(ValueError, match="passed as cleaned"):
+        clean.stage_counts(frame, cleaned=clean.clean(frame).iloc[:0])
+
+
 # --------------------------------------------------------------------------
 # Whole-pipeline properties
 # --------------------------------------------------------------------------
