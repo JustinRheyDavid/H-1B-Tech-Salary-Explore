@@ -7,13 +7,15 @@ Parquet cache built from a different set of source files: every rule still
 passes, and every headline number quietly changes.
 
 Skipped unless the cache is already built, so a fresh clone still gets a fast
-green suite. Marked ``slow`` — about 12 seconds — so ``pytest -m "not slow"``
-skips it even when the data is present.
+green suite. Marked ``slow`` — about 14 seconds and 2.7 GB of peak memory — so
+``pytest -m "not slow"`` skips it even when the data is present.
 
-Every constant below was measured on 2026-08-09 from the nine files listed in
-the README's Data sources section. If you add, remove, or re-download a file,
-these are expected to change: read a failure here as "the inputs moved", not
-"the cleaner broke", and re-derive rather than adjusting until it passes.
+Every constant below was measured on 2026-08-09 from the nine files named in
+:data:`SOURCE_FILES`. ``test_the_documented_source_files_are_what_is_loaded``
+checks those names before anything else runs, so a failure elsewhere in this
+module means the *cleaner* changed, not the inputs — debug it rather than
+re-deriving the constants. Only when the filename check itself fails are these
+numbers expected to move, and then every one of them must be measured again.
 """
 
 from __future__ import annotations
@@ -27,6 +29,14 @@ from src import clean, ingest
 
 DATA = Path(__file__).resolve().parent.parent / "data"
 RAW, INTERIM = DATA / "raw", DATA / "interim"
+
+# The exact nine files every constant below was measured from. "Dislclosure"
+# is DOL's misspelling, not a typo here.
+SOURCE_FILES = frozenset(
+    [f"LCA_Disclosure_Data_FY2024_Q{q}.xlsx" for q in (1, 2, 3, 4)]
+    + [f"LCA_Disclosure_Data_FY2025_Q{q}.xlsx" for q in (1, 2, 3, 4)]
+    + ["LCA_Dislclosure_Data_FY2026_Q2.xlsx"]
+)
 
 # Measured 2026-08-09. See the module docstring before changing any of these.
 ROWS_READ = 1_367_976  # after blank padding is dropped on read
@@ -76,17 +86,23 @@ def cleaned(raw):
     return clean.clean(raw)
 
 
-def test_the_documented_nine_source_files_are_what_is_loaded():
-    """Guards every other constant here. Fails first, and says why."""
-    files = ingest.source_files(RAW)
-    assert len(files) == 9, (
-        f"these numbers were measured on 9 source files, found {len(files)}; "
-        "re-derive the constants in this module rather than editing them"
+def test_the_documented_source_files_are_what_is_loaded():
+    """Guards every other constant here. Fails first, and says which file moved.
+
+    Counting the files is not enough — swap one quarter for another and the
+    count is still nine while every number below is measuring something else.
+    """
+    found = {p.name for p in ingest.source_files(RAW)}
+    assert found == SOURCE_FILES, (
+        "the constants in this module were measured on a different set of "
+        f"files. Unexpected: {sorted(found - SOURCE_FILES)}. "
+        f"Missing: {sorted(SOURCE_FILES - found)}. Every number here must be "
+        "re-measured before it can be trusted again."
     )
 
 
-def test_the_row_funnel_matches_the_documented_counts(raw):
-    counts = clean.stage_counts(raw, rows_read=ROWS_READ)
+def test_the_row_funnel_matches_the_documented_counts(raw, cleaned):
+    counts = clean.stage_counts(raw, rows_read=ROWS_READ, cleaned=cleaned)
     assert counts["unique filings"] == UNIQUE_FILINGS
     assert counts["duplicate cases"] == ROWS_READ - UNIQUE_FILINGS
     assert counts["not certified"] == UNIQUE_FILINGS - CERTIFIED
