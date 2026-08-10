@@ -147,27 +147,40 @@ This step exists to find the mess *before* writing the cleaner. Do not skip it a
 
 `clean.py` implements, as separate small functions:
 
-- `normalize_wage(row) -> float | None` — converts to annual USD (hourly × 2080, weekly × 52, bi-weekly × 26, monthly × 12), returns `None` for unparseable
-- `filter_status(df)` — keep `CERTIFIED` and `CERTIFIED-WITHDRAWN` only (A4)
-- `filter_tech_soc(df)` — keep SOC codes per A5
+- `to_wage(values, column)` — parse a wage column to `float64`; raise on a non-blank value that is not a number
+- `repair_units(values, unit, column)` — annualization multiplier, with wrong unit labels repaired (hourly × 2080, weekly × 52, bi-weekly × 26, monthly × 12)
+- `annualize(df)` / `annualize_prevailing(df)` — apply that to the offered wage band and to the prevailing wage
+- `filter_status(df)` — keep `Certified` and `Certified - Withdrawn` only (A4)
+- `is_tech(soc_codes)` — SOC major group 15 plus 11-3021, per A5
 - `normalize_employer(name) -> str` — uppercase, strip punctuation, collapse whitespace, strip trailing corporate suffixes
-- `normalize_city(city, state) -> (str, str)` — title-case city, two-letter uppercase state
-- `flag_outliers(df)` — mark rather than delete rows outside $10k–$2M annualized; the dashboard filters them, but they stay auditable
+- `normalize_city(city)` / `normalize_state(state)` — title-case city, two-letter uppercase state
+- `flag_outliers(wages)` — mark rather than delete rows outside $10k–$2M annualized; the dashboard filters them, but they stay auditable
+- `stage_counts(df, rows_read=None)` — rows surviving each stage, reconciled against `clean()`
 
-Every function is pure: DataFrame in, DataFrame out, no I/O, no globals.
+Every function is pure: Series or DataFrame in, Series or DataFrame out, no I/O, no globals.
 
-**Done when:** running the pipeline over one raw file produces a DataFrame where the wage unit is entirely annual, no nulls remain in the wage column for non-flagged rows, and the row count drop from raw to clean is printed and explainable.
+> **Corrected after the build.** This list originally named `normalize_wage`
+> and `filter_tech_soc`, neither of which was written — Step 3's findings split
+> the wage work across `to_wage`, `repair_units`, and `annualize`, and the SOC
+> filter became a predicate rather than a filter. The stale names went on to
+> mislead four reviews, so the list now matches the code.
+
+**Done when:** running the pipeline over one raw file produces a DataFrame where the wage unit is entirely annual, no nulls remain in the wage column for non-flagged rows, and the row count drop from raw to clean is explainable — `stage_counts` returns it, and the caller prints it, since nothing in `clean.py` does I/O.
 
 ---
 
 ### Step 5 — Tests for the cleaner
-**Files:** `tests/test_clean.py`
+**Files:** `tests/test_clean.py`, `tests/test_pipeline_numbers.py`, `conftest.py`
 
 Cover at minimum: hourly→annual conversion, monthly→annual, a null wage, a zero wage, a $5M outlier, `"MICROSOFT CORPORATION"` and `"Microsoft Corp."` normalizing to the same string, and a lowercase city with a lowercase state.
 
 Small step, disproportionate portfolio value — most junior projects have no tests at all, and this is the cheapest way to look senior.
 
-**Done when:** `pytest` passes with 8+ tests and every branch of `normalize_wage` is exercised.
+A second file, `tests/test_pipeline_numbers.py`, asserts the figures the README quotes against the real filings. Fixtures cannot catch a Parquet cache built from a different set of source files: every rule still passes and every headline number quietly changes. Marked `slow`, and skipped when the data is absent so a fresh clone still gets a fast green suite.
+
+`conftest.py` at the repo root puts that root on `sys.path` — without it the suite passes under `python -m pytest` and fails under bare `pytest`.
+
+**Done when:** bare `pytest` passes with 8+ tests, every branch of the wage path (`to_wage`, `repair_units`, `annualize`, `annualize_prevailing`, `flag_outliers`) is exercised, and reverting any single cleaning rule turns the suite red.
 
 ---
 
