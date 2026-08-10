@@ -99,6 +99,22 @@ one breaks an assumption a reasonable person would make:
    median of $118,248. After repair the mean is $130,848.
 9. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
    H-1B1 Chile, and H-1B1 Singapore — roughly 3% of rows.
+10. **`PREVAILING_WAGE` has the same unit defect, and it is worse.** Nine
+    certified filings carry an annual figure labelled `Week` or `Hour`, putting
+    the maximum prevailing wage at $360,056,320. Four of them pair it with a
+    perfectly ordinary offered wage, so any outlier check based on the offered
+    wage alone passes them through. The two columns are repaired and flagged
+    independently for that reason. Five filings survive repair with a figure
+    implausible under every unit — wrong at source, flagged rather than fixed.
+11. **2,216 filings have no `DECISION_DATE`.** All of them have a
+    `RECEIVED_DATE`, which this project falls back to so the row keeps a fiscal
+    year instead of dropping out of every trend chart. For those 0.16% of rows
+    the year is when the filing was received, not when it was decided. Three
+    were received in FY2023, a year these files do not otherwise cover, so the
+    fallback is floored at FY2024 — a case published in this data was decided
+    no earlier than that, and three rows are not a trend line. That floor is
+    `clean.EARLIEST_FISCAL_YEAR`; **change it if you swap the source files for
+    a different range of years.**
 
 ## Running locally
 
