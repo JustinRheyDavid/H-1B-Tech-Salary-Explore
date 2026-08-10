@@ -400,7 +400,10 @@ def clean(frame: pd.DataFrame, tech_only: bool = True) -> pd.DataFrame:
 
 
 def stage_counts(
-    frame: pd.DataFrame, tech_only: bool = True, rows_read: int | None = None
+    frame: pd.DataFrame,
+    tech_only: bool = True,
+    rows_read: int | None = None,
+    cleaned: pd.DataFrame | None = None,
 ) -> pd.Series:
     """Attribute every discarded row to the rule that discarded it.
 
@@ -419,6 +422,13 @@ def stage_counts(
     from the thing it describes is worse than no ledger, so a filter added to
     :func:`clean` and not here fails loudly instead of quietly balancing.
 
+    Pass ``cleaned`` if you already hold ``clean(frame)`` — the loader will —
+    to avoid running the pipeline a second time purely to count its output.
+    The second run adds about 530 MB while it is alive; how much of that shows
+    up as a lower process peak depends on what else the caller is holding, and
+    was about 200 MB for the test suite. Reconciliation still applies, so a
+    frame that is not this one's output raises.
+
     Returns counts rather than printing them; nothing else here does I/O.
     """
     certified = filter_status(frame)
@@ -429,7 +439,7 @@ def stage_counts(
         else len(certified)
     )
     n_untech = len(certified) - n_tech
-    rows_out = len(clean(frame, tech_only=tech_only))
+    rows_out = len(clean(frame, tech_only=tech_only) if cleaned is None else cleaned)
 
     stages: dict[str, int] = {}
     start = len(frame)
@@ -456,8 +466,10 @@ def stage_counts(
     stages["rows out"] = rows_out
 
     if start - dropped != rows_out:
+        source = "the frame passed as cleaned" if cleaned is not None else "clean()"
         raise ValueError(
-            f"stages account for {start - dropped:,} rows but clean() returns "
-            f"{rows_out:,}; a filter was added to clean() and not to stage_counts"
+            f"stages account for {start - dropped:,} rows but {source} holds "
+            f"{rows_out:,}; either a filter was added to clean() and not to "
+            "stage_counts, or these two frames are not from the same data"
         )
     return pd.Series(stages, dtype="int64")

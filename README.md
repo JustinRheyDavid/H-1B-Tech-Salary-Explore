@@ -20,7 +20,7 @@ between fiscal years. Cleaning it is most of the work.
 
 ## Status
 
-Build in progress. Steps 1-4 of 10 complete — see
+Build in progress. Steps 1-5 of 10 complete — see
 [`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md)
 for the full plan.
 
@@ -28,7 +28,7 @@ for the full plan.
 - [x] 2. Data acquisition
 - [x] 3. Exploration notebook
 - [x] 4. Cleaning module
-- [ ] 5. Tests
+- [x] 5. Tests
 - [ ] 6. Database schema and loader
 - [ ] 7. Query layer
 - [ ] 8. Streamlit dashboard
@@ -131,6 +131,7 @@ Requires Python 3.11 or newer.
 
 ```
 ├── app.py             # Streamlit entry point            (Step 8)
+├── conftest.py        # puts the repo root on sys.path   (Step 5)
 ├── src/
 │   ├── ingest.py      # read raw DOL files               (Step 4)
 │   ├── clean.py       # all normalization decisions      (Step 4)
