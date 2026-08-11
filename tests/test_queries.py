@@ -72,9 +72,37 @@ def eight_wages(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_percentiles_are_computed_by_nearest_rank(eight_wages):
+def test_percentiles_over_an_even_number_of_filings(eight_wages):
+    """100k..800k. The median averages the two middle rows; p25 and p75 do not.
+
+    450,000 rather than 400,000 is the whole point: taking the lower of the two
+    middle values biases every even-sized group downward.
+    """
     row = queries.salary_percentiles(db=eight_wages).iloc[0]
-    assert (row.p25, row.p50, row.p75, row.n_filings) == (200_000, 400_000, 600_000, 8)
+    assert (row.p25, row.p50, row.p75, row.n_filings) == (200_000, 450_000, 600_000, 8)
+
+
+@pytest.mark.parametrize(
+    "wages",
+    [
+        [100_000.0, 200_000.0],
+        [100_000.0, 200_000.0, 300_000.0],
+        [100_000.0, 200_000.0, 300_000.0, 400_000.0],
+        [90_000.0, 90_000.0, 100_000.0, 175_000.0, 175_000.0, 200_000.0],
+    ],
+)
+def test_the_median_agrees_with_pandas(tmp_path, wages):
+    """The number people check against. It has to be the one they get."""
+    db = database(tmp_path, WAGE_RATE_OF_PAY_FROM=list(wages))
+    assert queries.salary_percentiles(db=db).iloc[0].p50 == pd.Series(wages).median()
+
+
+def test_the_city_median_agrees_with_pandas(tmp_path):
+    """Where the old rule actually bit: 34% of real city medians read low."""
+    wages = [100_000.0, 120_000.0, 140_000.0, 190_000.0]
+    db = database(tmp_path, WAGE_RATE_OF_PAY_FROM=wages)
+    frame = queries.salary_by_city(min_filings=1, db=db)
+    assert frame["median_wage"].iloc[0] == pd.Series(wages).median() == 130_000.0
 
 
 def test_percentiles_of_a_single_filing_are_all_that_filing(tmp_path):
@@ -255,6 +283,29 @@ def test_title_search_collapses_spellings_that_differ_only_in_case(tmp_path):
         WAGE_RATE_OF_PAY_FROM=[100_000.0] * 3,
     )
     assert len(queries.title_search("data", db=db)) == 1
+
+
+@pytest.mark.parametrize("pattern", ["%", "_ngineer", "Engineer_", "10%"])
+def test_a_wildcard_typed_in_the_box_is_matched_literally(tmp_path, pattern):
+    """Parameterising stops the value being syntax, not being a pattern.
+
+    Unescaped, "%" returns the whole list and "_ngineer" matches "Engineer".
+    """
+    db = database(
+        tmp_path,
+        JOB_TITLE=["Engineer", "Engineer 2"],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0, 100_000.0],
+    )
+    assert queries.title_search(pattern, db=db) == []
+
+
+def test_a_literal_percent_in_a_title_is_still_findable(tmp_path):
+    db = database(
+        tmp_path,
+        JOB_TITLE=["100% Remote Engineer", "Engineer"],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0, 100_000.0],
+    )
+    assert queries.title_search("100%", db=db) == ["100% Remote Engineer"]
 
 
 def test_title_search_respects_its_limit_and_can_find_nothing(tmp_path):

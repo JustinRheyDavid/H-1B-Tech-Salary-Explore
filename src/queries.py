@@ -2,12 +2,22 @@
 
 Two decisions shape all the SQL below.
 
-**Percentiles are computed by hand.** SQLite has no ``PERCENTILE_CONT``, so
-each query ranks its rows with ``ROW_NUMBER()``, counts them with ``COUNT(*)
-OVER ()``, and takes the first value at or past the target position — the
-nearest-rank definition. ``position * 2 >= n`` is the median, ``position * 4
->= n`` the 25th percentile, ``position * 4 >= n * 3`` the 75th. Integer
-arithmetic on purpose: no floats, nothing to round the wrong way.
+**Percentiles are computed by hand**, because SQLite has no ``PERCENTILE_CONT``.
+Every query ranks its rows with ``ROW_NUMBER()`` and counts them with
+``COUNT(*) OVER ()``, then reads off the position it wants.
+
+The median averages the two middle rows when there is an even number of them,
+which is what everyone means by "median" and what pandas and Excel return.
+Taking the lower of the two instead — the tempting one-liner — biases *every*
+even-sized group downward: on real data that moved 34% of city medians, by up
+to $12,850. See :data:`_MEDIAN`.
+
+``p25`` and ``p75`` use the simpler nearest-rank rule: the first value at or
+past the target position, no interpolation. That is ``PERCENTILE_DISC`` rather
+than ``PERCENTILE_CONT``, and it can differ from pandas by less than the gap
+between two adjacent wages. It matters least where it is used — those two
+appear only in the metric cards for a whole filtered slice, which has hundreds
+of filings, never in the small per-city groups where the median's bias showed.
 
 **Titles are matched case-insensitively, through the lookup table.** Employers
 file the same job under any capitalisation — 3,587 filings say "Data Analyst"
@@ -55,6 +65,29 @@ DEFAULT_JOB_TITLE = "Software Engineer"
 _TITLE_MATCHES = (
     "f.title_id IN (SELECT title_id FROM titles WHERE job_title = ? COLLATE NOCASE)"
 )
+
+# The median over a `ranked` CTE exposing `position` (1..n) and `n`.
+#
+# Odd n: one middle row, at position (n + 1) / 2, so position * 2 = n + 1.
+# Even n: two middle rows, at n / 2 and n / 2 + 1, so position * 2 is n or
+# n + 2. Half of each is summed, which is their average. Nothing else matches,
+# and multiplying by 1.0 keeps the column REAL whether n is odd or even.
+_MEDIAN = """SUM(CASE WHEN position * 2 = n     THEN annual_wage * 0.5
+                      WHEN position * 2 = n + 2 THEN annual_wage * 0.5
+                      WHEN position * 2 = n + 1 THEN annual_wage * 1.0 END)"""
+
+
+def _escape_like(text: str) -> str:
+    r"""Make ``text`` a literal prefix rather than a LIKE pattern.
+
+    ``%`` and ``_`` are wildcards, so someone typing ``C_`` in the title box
+    would match ``C#`` and ``C++`` and a plain ``%`` would return everything.
+    Parameterising the value stops it being *syntax*; it does not stop it being
+    a pattern. The backslash must be escaped first or it would escape itself.
+    """
+    for character in ("\\", "%", "_"):
+        text = text.replace(character, f"\\{character}")
+    return text
 
 
 def _run(sql: str, params: Sequence[Any], db: Path | None) -> pd.DataFrame:
@@ -120,7 +153,7 @@ def salary_percentiles(
             WHERE {where}
         )
         SELECT MIN(CASE WHEN position * 4 >= n     THEN annual_wage END) AS p25,
-               MIN(CASE WHEN position * 2 >= n     THEN annual_wage END) AS p50,
+               {_MEDIAN}                                                 AS p50,
                MIN(CASE WHEN position * 4 >= n * 3 THEN annual_wage END) AS p75,
                COALESCE(MAX(n), 0)                                       AS n_filings
         FROM ranked
@@ -166,8 +199,8 @@ def top_employers(
             WHERE {where}
         )
         SELECT e.employer_name,
-               MAX(n)                                               AS n_filings,
-               MIN(CASE WHEN position * 2 >= n THEN annual_wage END) AS median_wage
+               MAX(n)   AS n_filings,
+               {_MEDIAN} AS median_wage
         FROM ranked r
         JOIN employers e ON e.employer_id = r.employer_id
         GROUP BY r.employer_id
@@ -202,8 +235,8 @@ def salary_by_city(
             WHERE {where}
         )
         SELECT worksite_city, worksite_state,
-               MIN(CASE WHEN position * 2 >= n THEN annual_wage END) AS median_wage,
-               MAX(n)                                                AS n_filings
+               {_MEDIAN} AS median_wage,
+               MAX(n)   AS n_filings
         FROM ranked
         GROUP BY worksite_city, worksite_state
         HAVING n_filings >= ?
@@ -241,7 +274,7 @@ def salary_trend(
         ),
         per_year AS (
             SELECT fiscal_year,
-                   MIN(CASE WHEN position * 2 >= n THEN annual_wage END) AS median_wage,
+                   {_MEDIAN} AS median_wage,
                    MAX(n) AS n_filings
             FROM ranked
             GROUP BY fiscal_year
@@ -276,16 +309,16 @@ def title_search(
     on every keystroke.
     """
     frame = _run(
-        """
+        r"""
         SELECT t.job_title, COUNT(*) AS n
         FROM filings f
         JOIN titles t ON t.title_id = f.title_id
-        WHERE t.job_title LIKE ? || '%'
+        WHERE t.job_title LIKE ? || '%' ESCAPE '\'
         GROUP BY lower(t.job_title)
         ORDER BY n DESC, t.job_title
         LIMIT ?
         """,
-        [prefix, limit],
+        [_escape_like(prefix), limit],
         db,
     )
     return frame["job_title"].tolist()
