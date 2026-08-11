@@ -65,6 +65,7 @@ _TITLE_MATCHES = (
     "f.title_id IN (SELECT title_id FROM titles WHERE job_title = ? COLLATE NOCASE)"
 )
 
+
 def _percentile(fraction: float) -> str:
     """SQL for one percentile over a ranked CTE exposing ``position`` and ``n``.
 
@@ -86,21 +87,45 @@ def _percentile(fraction: float) -> str:
 _MEDIAN = _percentile(0.50)
 
 
-def _count(name: str, value: Any) -> int:
-    """Check a row count before it reaches SQL, and say so if it is wrong.
+# Arguments are checked before they reach SQL, because SQLite's response to a
+# wrong type is an answer rather than an error: a negative LIMIT means *no
+# limit*, a string compared against an INTEGER column matches nothing, and a
+# non-empty string is truthy whatever it says. Each of those reads as data.
 
-    A negative ``LIMIT`` is not an error in SQLite — it means *no limit*. So
+
+def _whole_number(name: str, value: Any) -> int:
+    """A count or a year. Rejects negatives, non-integers, and ``bool``.
+
     ``limit=-1`` silently returns 2,428 employers where 20 were asked for, and
-    an autocomplete asking for 25 titles gets 5,253. Nothing downstream would
-    report that; it would just render.
+    an autocomplete asking for 25 titles gets 5,253, because SQLite reads a
+    negative ``LIMIT`` as no limit at all. ``fiscal_year="2025"`` matches no
+    rows and reads as "nobody filed that year".
 
-    ``bool`` is excluded deliberately: it is a subclass of ``int``, so
-    ``limit=True`` would otherwise quietly mean ``limit=1``.
+    ``bool`` is excluded deliberately: it subclasses ``int``, so ``limit=True``
+    would otherwise quietly mean ``limit=1``.
     """
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{name} must be a whole number, got {value!r}")
     if value < 0:
         raise ValueError(f"{name} must not be negative, got {value}")
+    return value
+
+
+def _flag(name: str, value: Any) -> bool:
+    """A true/false switch, and only that.
+
+    Every non-empty string is truthy, so ``include_outliers="no"`` would turn
+    the outlier filter *off* — the opposite of what it says.
+    """
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be True or False, got {value!r}")
+    return value
+
+
+def _text(name: str, value: Any) -> str | None:
+    """An optional string filter. ``None`` means "do not filter on this"."""
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"{name} must be text or None, got {value!r}")
     return value
 
 
@@ -137,22 +162,20 @@ def _where(
     clauses = ["f.annual_wage IS NOT NULL"]
     params: list[Any] = []
 
-    if not include_outliers:
+    if not _flag("include_outliers", include_outliers):
         clauses.append("f.is_outlier = 0")
-    if job_title is not None:
+    if _text("job_title", job_title) is not None:
         clauses.append(_TITLE_MATCHES)
         params.append(job_title)
-    if city is not None:
+    if _text("city", city) is not None:
         clauses.append("l.worksite_city = ? COLLATE NOCASE")
         params.append(city)
-    if state is not None:
+    if _text("state", state) is not None:
         clauses.append("l.worksite_state = ? COLLATE NOCASE")
         params.append(state)
     if fiscal_year is not None:
-        # A string here compares against an INTEGER column, matches nothing,
-        # and reads as "no filings that year" rather than as a mistake.
         clauses.append("f.fiscal_year = ?")
-        params.append(_count("fiscal_year", fiscal_year))
+        params.append(_whole_number("fiscal_year", fiscal_year))
 
     return " AND ".join(clauses), params
 
@@ -235,7 +258,7 @@ def top_employers(
         GROUP BY r.employer_id
         ORDER BY n_filings DESC, e.employer_name
         """,
-        [*params, _count("limit", limit), *params],
+        [*params, _whole_number("limit", limit), *params],
         db,
     )
 
@@ -271,7 +294,7 @@ def salary_by_city(
         HAVING n_filings >= ?
         ORDER BY median_wage DESC, worksite_city
         """,
-        [*params, _count("min_filings", min_filings)],
+        [*params, _whole_number("min_filings", min_filings)],
         db,
     )
 
@@ -351,7 +374,7 @@ def title_search(
         ORDER BY n DESC, t.job_title
         LIMIT ?
         """,
-        [_escape_like(prefix or ""), _count("limit", limit)],
+        [_escape_like(_text("prefix", prefix) or ""), _whole_number("limit", limit)],
         db,
     )
     return frame["job_title"].tolist()

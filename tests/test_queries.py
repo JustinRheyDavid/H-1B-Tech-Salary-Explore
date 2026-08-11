@@ -395,6 +395,29 @@ def test_a_count_that_is_not_a_whole_number_is_refused(eight_wages, call, kwargs
         call(db=eight_wages, **kwargs)
 
 
+@pytest.mark.parametrize("value", ["no", "false", "0", "yes", 1, 0, None, []])
+def test_include_outliers_must_be_a_real_boolean(eight_wages, value):
+    """Every non-empty string is truthy, so "no" would turn the filter off."""
+    with pytest.raises(TypeError, match="True or False"):
+        queries.salary_percentiles(include_outliers=value, db=eight_wages)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"job_title": 123}, {"city": 456}, {"state": 7}, {"job_title": ["a"]}],
+)
+def test_a_filter_that_is_not_text_is_refused(eight_wages, kwargs):
+    """An integer compared against a TEXT column matches nothing, which reads
+    as "no filings" rather than as the wrong type."""
+    with pytest.raises(TypeError, match="text or None"):
+        queries.salary_percentiles(db=eight_wages, **kwargs)
+
+
+def test_title_search_refuses_a_prefix_that_is_not_text(eight_wages):
+    with pytest.raises(TypeError, match="text or None"):
+        queries.title_search(123, db=eight_wages)
+
+
 def test_zero_is_a_legitimate_count(eight_wages):
     assert len(queries.top_employers(limit=0, db=eight_wages)) == 0
     assert queries.title_search(limit=0, db=eight_wages) == []
