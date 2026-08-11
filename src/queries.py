@@ -4,20 +4,19 @@ Two decisions shape all the SQL below.
 
 **Percentiles are computed by hand**, because SQLite has no ``PERCENTILE_CONT``.
 Every query ranks its rows with ``ROW_NUMBER()`` and counts them with
-``COUNT(*) OVER ()``, then reads off the position it wants.
+``COUNT(*) OVER ()``, then interpolates between the two rows either side of the
+position it wants — the same definition pandas, numpy and Excel use, so a
+figure on the dashboard is the figure someone gets checking it themselves.
 
-The median averages the two middle rows when there is an even number of them,
-which is what everyone means by "median" and what pandas and Excel return.
-Taking the lower of the two instead — the tempting one-liner — biases *every*
-even-sized group downward: on real data that moved 34% of city medians, by up
-to $12,850. See :data:`_MEDIAN`.
+The tempting alternative is to walk up the sorted rows and take the first one
+at or past the target. For an odd count that lands on the middle row and is
+right; for an even count it always takes the *lower* of the two middle rows,
+biasing every even-sized group downward. On real data that moved 34% of city
+medians, by up to $12,850, always in the same direction. See :data:`_MEDIAN`.
 
-``p25`` and ``p75`` use the simpler nearest-rank rule: the first value at or
-past the target position, no interpolation. That is ``PERCENTILE_DISC`` rather
-than ``PERCENTILE_CONT``, and it can differ from pandas by less than the gap
-between two adjacent wages. It matters least where it is used — those two
-appear only in the metric cards for a whole filtered slice, which has hundreds
-of filings, never in the small per-city groups where the median's bias showed.
+Phase 2 ports these to Azure SQL's ``PERCENTILE_CONT``, which is this same
+definition — so the two backends can be checked against each other exactly
+rather than approximately.
 
 **Titles are matched case-insensitively, through the lookup table.** Employers
 file the same job under any capitalisation — 3,587 filings say "Data Analyst"
@@ -66,15 +65,25 @@ _TITLE_MATCHES = (
     "f.title_id IN (SELECT title_id FROM titles WHERE job_title = ? COLLATE NOCASE)"
 )
 
-# The median over a `ranked` CTE exposing `position` (1..n) and `n`.
-#
-# Odd n: one middle row, at position (n + 1) / 2, so position * 2 = n + 1.
-# Even n: two middle rows, at n / 2 and n / 2 + 1, so position * 2 is n or
-# n + 2. Half of each is summed, which is their average. Nothing else matches,
-# and multiplying by 1.0 keeps the column REAL whether n is odd or even.
-_MEDIAN = """SUM(CASE WHEN position * 2 = n     THEN annual_wage * 0.5
-                      WHEN position * 2 = n + 2 THEN annual_wage * 0.5
-                      WHEN position * 2 = n + 1 THEN annual_wage * 1.0 END)"""
+def _percentile(fraction: float) -> str:
+    """SQL for one percentile over a ranked CTE exposing ``position`` and ``n``.
+
+    The target sits at position ``1 + fraction * (n - 1)``, which is usually
+    between two rows. Each row is weighted by how close it is — ``1`` if it
+    lands exactly on the target, ``0`` once it is a full position away — so the
+    only rows contributing are the two either side, and their weights sum to 1.
+    That is linear interpolation, written as one aggregate rather than a join
+    against a computed floor and ceiling.
+
+    The three fractions used here give offsets of .0, .25, .5 or .75, all of
+    which are exact in binary, so the weights carry no rounding error.
+    """
+    target = f"(1 + {fraction} * (n - 1))"
+    return f"SUM(annual_wage * max(0.0, 1.0 - abs(position - {target})))"
+
+
+# The median, by far the most reused of the three.
+_MEDIAN = _percentile(0.50)
 
 
 def _escape_like(text: str) -> str:
@@ -152,10 +161,10 @@ def salary_percentiles(
             JOIN locations l ON l.location_id = f.location_id
             WHERE {where}
         )
-        SELECT MIN(CASE WHEN position * 4 >= n     THEN annual_wage END) AS p25,
-               {_MEDIAN}                                                 AS p50,
-               MIN(CASE WHEN position * 4 >= n * 3 THEN annual_wage END) AS p75,
-               COALESCE(MAX(n), 0)                                       AS n_filings
+        SELECT {_percentile(0.25)} AS p25,
+               {_MEDIAN}           AS p50,
+               {_percentile(0.75)} AS p75,
+               COALESCE(MAX(n), 0) AS n_filings
         FROM ranked
         """,
         params,
@@ -292,7 +301,7 @@ def salary_trend(
 
 
 def title_search(
-    prefix: str = "", limit: int = 25, db: Path | None = None
+    prefix: str | None = "", limit: int = 25, db: Path | None = None
 ) -> list[str]:
     """Job titles starting with ``prefix``, most filed first.
 
@@ -302,6 +311,10 @@ def title_search(
     Spellings that differ only in case are one entry, represented by whichever
     the database happens to return for the group. Any of them finds the same
     filings, because every query here matches titles case-insensitively.
+
+    ``None`` is treated as an empty prefix. A picker with nothing selected
+    hands back ``None`` rather than ``""``, and the two mean the same thing
+    here — the alternative is an AttributeError surfacing in the browser.
 
     Outliers are counted here, unlike everywhere else. They are 37 rows in
     850,321 and cannot change an ordering, and excluding them turns a 42 ms
@@ -318,7 +331,7 @@ def title_search(
         ORDER BY n DESC, t.job_title
         LIMIT ?
         """,
-        [_escape_like(prefix), limit],
+        [_escape_like(prefix or ""), limit],
         db,
     )
     return frame["job_title"].tolist()

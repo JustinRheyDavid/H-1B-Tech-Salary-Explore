@@ -73,13 +73,13 @@ def eight_wages(tmp_path):
 
 
 def test_percentiles_over_an_even_number_of_filings(eight_wages):
-    """100k..800k. The median averages the two middle rows; p25 and p75 do not.
+    """100k..800k, so the targets land between rows and must interpolate.
 
-    450,000 rather than 400,000 is the whole point: taking the lower of the two
-    middle values biases every even-sized group downward.
+    p50 = 450,000 rather than 400,000 is the point: taking the lower of the two
+    middle rows biases every even-sized group downward.
     """
     row = queries.salary_percentiles(db=eight_wages).iloc[0]
-    assert (row.p25, row.p50, row.p75, row.n_filings) == (200_000, 450_000, 600_000, 8)
+    assert (row.p25, row.p50, row.p75, row.n_filings) == (275_000, 450_000, 625_000, 8)
 
 
 @pytest.mark.parametrize(
@@ -89,12 +89,21 @@ def test_percentiles_over_an_even_number_of_filings(eight_wages):
         [100_000.0, 200_000.0, 300_000.0],
         [100_000.0, 200_000.0, 300_000.0, 400_000.0],
         [90_000.0, 90_000.0, 100_000.0, 175_000.0, 175_000.0, 200_000.0],
+        [float(w) for w in (61_000, 83_500, 97_250, 120_000, 155_900)],
     ],
 )
-def test_the_median_agrees_with_pandas(tmp_path, wages):
-    """The number people check against. It has to be the one they get."""
+def test_all_three_percentiles_agree_with_pandas(tmp_path, wages):
+    """The numbers people check against. They have to be the ones they get.
+
+    pandas, numpy and Excel all interpolate linearly, and so does Azure SQL's
+    PERCENTILE_CONT, which Phase 2 ports these to.
+    """
     db = database(tmp_path, WAGE_RATE_OF_PAY_FROM=list(wages))
-    assert queries.salary_percentiles(db=db).iloc[0].p50 == pd.Series(wages).median()
+    row = queries.salary_percentiles(db=db).iloc[0]
+    series = pd.Series(wages)
+    assert row.p25 == pytest.approx(series.quantile(0.25))
+    assert row.p50 == pytest.approx(series.median())
+    assert row.p75 == pytest.approx(series.quantile(0.75))
 
 
 def test_the_city_median_agrees_with_pandas(tmp_path):
@@ -306,6 +315,17 @@ def test_a_literal_percent_in_a_title_is_still_findable(tmp_path):
         WAGE_RATE_OF_PAY_FROM=[100_000.0, 100_000.0],
     )
     assert queries.title_search("100%", db=db) == ["100% Remote Engineer"]
+
+
+def test_title_search_treats_none_as_no_prefix(tmp_path):
+    """A picker with nothing selected hands back None, not an empty string."""
+    db = database(
+        tmp_path,
+        JOB_TITLE=["Engineer", "Analyst"],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0, 100_000.0],
+    )
+    assert sorted(queries.title_search(None, db=db)) == ["Analyst", "Engineer"]
+    assert queries.title_search(None, db=db) == queries.title_search("", db=db)
 
 
 def test_title_search_respects_its_limit_and_can_find_nothing(tmp_path):
