@@ -20,6 +20,11 @@ data/interim/
 *.db-wal
 data/probe.db
 
+# Scratch files from the atomic writes in load.py and ingest.py. Normally
+# deleted on the way out, but a hard kill strands one — and load.py's is a
+# near-complete copy of the 78 MB database, sitting right next to it in data/.
+*.tmp
+
 # --- Python -------------------------------------------------------------
 __pycache__/
 *.py[cod]
