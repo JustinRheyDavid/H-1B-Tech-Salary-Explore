@@ -214,7 +214,7 @@ Write real SQL here — `GROUP BY`, `HAVING`, `JOIN`, and at least one window fu
 >
 > **Titles must match case-insensitively.** 3,587 filings say `Data Analyst` and 777 say `DATA ANALYST`; an exact match loses 17% of them.
 >
-> **The unfiltered case cannot meet the 1-second bar, and no index fixes it.** Ranking all 850,321 rows costs 0.5–1.5 s because SQLite sorts for a window function whether or not an index could supply the order — four covering indexes on `annual_wage` were measured at **+58 MB for no improvement**. With any job title selected every function answers in 8–120 ms, so `queries.DEFAULT_JOB_TITLE` exists and Step 8's sidebar must open with it set.
+> **The unfiltered case cannot meet the 1-second bar, and no index fixes it.** Ranking all 850,321 rows costs 0.7–1.6 s because SQLite sorts for a window function whether or not an index could supply the order — four covering indexes on `annual_wage` were measured at **+58 MB for no improvement**. With any job title selected every function answers in 8–130 ms, so `queries.DEFAULT_JOB_TITLE` exists and Step 8's sidebar must open with it set.
 
 **Done when:** every function runs against `h1b.db` from a plain Python REPL and returns non-empty results for `("Data Analyst", "Austin", "TX")`, and no query with a job title selected takes over 1 second.
 

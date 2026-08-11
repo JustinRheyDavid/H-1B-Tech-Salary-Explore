@@ -29,8 +29,8 @@ Every value that reaches SQL does so as a ``?`` parameter. The only strings
 this module interpolates are its own WHERE clauses, chosen by which arguments
 are None.
 
-**Pass a job title.** Filtered, every function here answers in 8-14 ms.
-Unfiltered, they rank all 850,321 rows and take 0.5-1.5 seconds, and no index
+**Pass a job title.** Filtered, every function here answers in 8-130 ms.
+Unfiltered, they rank all 850,321 rows and take 0.7-1.6 seconds, and no index
 fixes that: four covering indexes on ``annual_wage`` were measured at +58 MB
 for no improvement at all, because SQLite sorts for a window function whether
 or not an index could supply the order. :data:`DEFAULT_JOB_TITLE` exists so
@@ -86,6 +86,24 @@ def _percentile(fraction: float) -> str:
 _MEDIAN = _percentile(0.50)
 
 
+def _count(name: str, value: Any) -> int:
+    """Check a row count before it reaches SQL, and say so if it is wrong.
+
+    A negative ``LIMIT`` is not an error in SQLite — it means *no limit*. So
+    ``limit=-1`` silently returns 2,428 employers where 20 were asked for, and
+    an autocomplete asking for 25 titles gets 5,253. Nothing downstream would
+    report that; it would just render.
+
+    ``bool`` is excluded deliberately: it is a subclass of ``int``, so
+    ``limit=True`` would otherwise quietly mean ``limit=1``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be a whole number, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{name} must not be negative, got {value}")
+    return value
+
+
 def _escape_like(text: str) -> str:
     r"""Make ``text`` a literal prefix rather than a LIKE pattern.
 
@@ -131,8 +149,10 @@ def _where(
         clauses.append("l.worksite_state = ? COLLATE NOCASE")
         params.append(state)
     if fiscal_year is not None:
+        # A string here compares against an INTEGER column, matches nothing,
+        # and reads as "no filings that year" rather than as a mistake.
         clauses.append("f.fiscal_year = ?")
-        params.append(fiscal_year)
+        params.append(_count("fiscal_year", fiscal_year))
 
     return " AND ".join(clauses), params
 
@@ -215,7 +235,7 @@ def top_employers(
         GROUP BY r.employer_id
         ORDER BY n_filings DESC, e.employer_name
         """,
-        [*params, limit, *params],
+        [*params, _count("limit", limit), *params],
         db,
     )
 
@@ -251,7 +271,7 @@ def salary_by_city(
         HAVING n_filings >= ?
         ORDER BY median_wage DESC, worksite_city
         """,
-        [*params, min_filings],
+        [*params, _count("min_filings", min_filings)],
         db,
     )
 
@@ -331,7 +351,7 @@ def title_search(
         ORDER BY n DESC, t.job_title
         LIMIT ?
         """,
-        [_escape_like(prefix or ""), limit],
+        [_escape_like(prefix or ""), _count("limit", limit)],
         db,
     )
     return frame["job_title"].tolist()

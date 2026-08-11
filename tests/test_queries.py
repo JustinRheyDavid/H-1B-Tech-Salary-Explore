@@ -360,6 +360,48 @@ def test_every_function_returns_the_columns_the_plan_specifies(eight_wages):
 
 
 @pytest.mark.parametrize(
+    ("call", "kwargs"),
+    [
+        (queries.top_employers, {"limit": -1}),
+        (queries.title_search, {"limit": -5}),
+        (queries.salary_by_city, {"min_filings": -3}),
+    ],
+)
+def test_a_negative_count_is_refused_not_reinterpreted(eight_wages, call, kwargs):
+    """SQLite reads a negative LIMIT as no limit, so -1 returns everything.
+
+    An autocomplete asking for 25 titles was handed 5,253, and nothing
+    downstream would have reported it.
+    """
+    with pytest.raises(ValueError, match="must not be negative"):
+        call(db=eight_wages, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("call", "kwargs"),
+    [
+        (queries.top_employers, {"limit": "20"}),
+        (queries.top_employers, {"limit": True}),
+        (queries.salary_percentiles, {"fiscal_year": "2025"}),
+    ],
+)
+def test_a_count_that_is_not_a_whole_number_is_refused(eight_wages, call, kwargs):
+    """A string fiscal_year compares against an INTEGER column and matches
+    nothing, which reads as "no filings that year" rather than as a typo.
+
+    ``True`` is rejected too: bool subclasses int, so it would mean ``1``.
+    """
+    with pytest.raises(TypeError, match="whole number"):
+        call(db=eight_wages, **kwargs)
+
+
+def test_zero_is_a_legitimate_count(eight_wages):
+    assert len(queries.top_employers(limit=0, db=eight_wages)) == 0
+    assert queries.title_search(limit=0, db=eight_wages) == []
+    assert len(queries.salary_by_city(min_filings=0, db=eight_wages)) == 1
+
+
+@pytest.mark.parametrize(
     "hostile",
     ["'; DROP TABLE filings; --", "%", "_", "' OR 1=1 --", 'Data" OR "1"="1'],
 )
