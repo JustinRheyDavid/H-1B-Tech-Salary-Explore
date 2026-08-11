@@ -187,9 +187,9 @@ A second file, `tests/test_pipeline_numbers.py`, asserts the figures the README 
 ### Step 6 — Database schema and loader
 **Files:** `src/load.py`, produces `data/h1b.db`
 
-Three-table normalized schema (see §6). `load.py` creates tables, inserts cleaned data, creates indexes, and is **idempotent** — re-running it drops and rebuilds rather than duplicating rows.
+Six-table normalized schema (see §6). `load.py` creates tables, inserts cleaned data, creates indexes, and is **idempotent** — it builds into a scratch file and renames that over `h1b.db` only once the load is complete, so re-running never duplicates rows and a failed run leaves the previous database intact.
 
-After loading, run `VACUUM` to shrink the file. Then check size: if `h1b.db` exceeds ~200 MB, drop unused source columns rather than fighting git.
+After loading, run `VACUUM` to shrink the file. Then check size: **the file must stay under 100 MB, which is GitHub's hard limit for a single file.** There is no negotiating with it and no warning before the push is rejected.
 
 **Done when:** `python -m src.load` builds `data/h1b.db` from scratch in one command, `SELECT COUNT(*) FROM filings` matches the cleaned row count, and running it twice produces an identical file size.
 
@@ -258,7 +258,16 @@ Must contain, in order:
 
 ## 6. Data model
 
-SQLite. Three tables, normalized enough to justify joins without being academic about it.
+SQLite. Six tables, normalized enough to justify joins without being academic about it.
+
+> **Corrected after Step 6 was built.** This section originally specified three
+> tables with `job_title` stored inline and wages as `REAL`. That schema was
+> built and measured at **148 MB** — above GitHub's 100 MB hard limit for a
+> single file, so a repo containing it cannot be pushed at all. Step 6's own
+> text said "if `h1b.db` exceeds ~200 MB, drop unused source columns", which is
+> a threshold above the one that actually blocks you. The schema below is what
+> `src/load.py` builds: 78 MB with all 850,321 filings and no columns dropped.
+> `queries.py` should be written against `v_filings`, not the raw tables.
 
 ```sql
 CREATE TABLE employers (
@@ -268,39 +277,69 @@ CREATE TABLE employers (
 );
 
 CREATE TABLE occupations (
-    soc_id     INTEGER PRIMARY KEY,
-    soc_code   TEXT NOT NULL UNIQUE,        -- e.g. '15-2051'
-    soc_title  TEXT NOT NULL                -- e.g. 'Data Scientists'
+    soc_id    INTEGER PRIMARY KEY,
+    soc_code  TEXT NOT NULL UNIQUE,         -- e.g. '15-2051'
+    soc_title TEXT NOT NULL                 -- e.g. 'Data Scientists'
+);
+
+-- Titles stay raw; storing each of the 123,990 distinct ones once instead of
+-- 850,321 times is a storage decision, not a data one. Saves 29 MB.
+CREATE TABLE titles (
+    title_id  INTEGER PRIMARY KEY,
+    job_title TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE locations (
+    location_id    INTEGER PRIMARY KEY,
+    worksite_city  TEXT NOT NULL,
+    worksite_state TEXT NOT NULL,           -- 2-letter
+    UNIQUE (worksite_city, worksite_state)
+);
+
+CREATE TABLE visa_classes (                 -- H-1B, E-3, H-1B1; all loaded
+    visa_class_id INTEGER PRIMARY KEY,
+    visa_class    TEXT NOT NULL UNIQUE
 );
 
 CREATE TABLE filings (
-    filing_id       INTEGER PRIMARY KEY,
-    case_number     TEXT NOT NULL UNIQUE,
+    case_serial     INTEGER PRIMARY KEY,    -- the digits of 'I-200-25001-000001'
+    case_prefix     INTEGER NOT NULL,       -- the 200 in 'I-200-'
     employer_id     INTEGER NOT NULL REFERENCES employers(employer_id),
     soc_id          INTEGER NOT NULL REFERENCES occupations(soc_id),
-    job_title       TEXT NOT NULL,          -- employer's own title, kept raw
-    worksite_city   TEXT,
-    worksite_state  TEXT,                   -- 2-letter
-    annual_wage     REAL,                   -- normalized USD/year
-    prevailing_wage REAL,                   -- normalized USD/year
-    full_time       INTEGER,                -- 0/1
+    title_id        INTEGER NOT NULL REFERENCES titles(title_id),
+    location_id     INTEGER REFERENCES locations(location_id),
+    visa_class_id   INTEGER NOT NULL REFERENCES visa_classes(visa_class_id),
+    annual_wage     INTEGER,                -- whole USD/year, band midpoint
+    annual_from     INTEGER,
+    annual_to       INTEGER,                -- NULL when the filing gave no band
+    prevailing_wage INTEGER,
     fiscal_year     INTEGER NOT NULL,
-    case_status     TEXT NOT NULL,
-    is_outlier      INTEGER NOT NULL DEFAULT 0
+    full_time       INTEGER NOT NULL,       -- 0/1
+    withdrawn       INTEGER NOT NULL,       -- 1 = 'Certified - Withdrawn'
+    is_outlier      INTEGER NOT NULL DEFAULT 0,
+    pw_outlier      INTEGER NOT NULL DEFAULT 0,
+    unit_repaired   INTEGER NOT NULL DEFAULT 0,
+    pw_repaired     INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX idx_filings_title ON filings(job_title);
-CREATE INDEX idx_filings_city  ON filings(worksite_city, worksite_state);
-CREATE INDEX idx_filings_year  ON filings(fiscal_year);
-CREATE INDEX idx_filings_soc   ON filings(soc_id);
+-- Only the two columns queries filter on. Each index costs ~9 MB at this row
+-- count; fiscal_year (3 distinct values) and soc_id (63) are too
+-- low-cardinality to beat a scan, and titles.job_title is already indexed by
+-- its UNIQUE constraint, which is what title_search uses.
+CREATE INDEX idx_filings_title    ON filings(title_id);
+CREATE INDEX idx_filings_location ON filings(location_id);
+
+-- Everything joined, case number reassembled. Query this, not the tables.
+CREATE VIEW v_filings AS ...;               -- see src/load.py for the body
 ```
 
 **Key types and rules:**
 
-- `annual_wage` is always USD/year; `NULL` if the source was unparseable. Rows with `NULL` wages load but are excluded from every aggregate.
+- `annual_wage` is always whole USD/year; `NULL` if the source was unparseable. Rows with `NULL` wages load but are excluded from every aggregate.
 - `job_title` stays raw. It is what users search on and normalizing it destroys signal; `soc_title` provides the clean grouping.
-- `is_outlier = 1` for annualized wages under $10,000 or over $2,000,000. Never deleted, only filtered.
-- `case_number` is the natural key and enforces idempotent loads.
+- `is_outlier = 1` for annualized wages under $10,000 or over $2,000,000. Never deleted, only filtered. `pw_outlier` is the same test on the prevailing wage, flagged separately because a filing can pair a sensible offer with a nonsense prevailing wage.
+- `case_serial` is the natural key. Using it as the rowid enforces uniqueness without a second index, which a `case_number TEXT UNIQUE` column costs 12.8 MB for.
+- The loader writes to a scratch file and renames it into place, so a failed run leaves the previous database intact rather than replacing it with a valid-looking empty one.
 
 **Query-layer function signatures:**
 

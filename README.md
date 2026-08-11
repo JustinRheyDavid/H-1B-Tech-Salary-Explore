@@ -20,7 +20,7 @@ between fiscal years. Cleaning it is most of the work.
 
 ## Status
 
-Build in progress. Steps 1-5 of 10 complete — see
+Build in progress. Steps 1-6 of 10 complete — see
 [`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md)
 for the full plan.
 
@@ -29,7 +29,7 @@ for the full plan.
 - [x] 3. Exploration notebook
 - [x] 4. Cleaning module
 - [x] 5. Tests
-- [ ] 6. Database schema and loader
+- [x] 6. Database schema and loader
 - [ ] 7. Query layer
 - [ ] 8. Streamlit dashboard
 - [ ] 9. Deploy
@@ -98,7 +98,9 @@ one breaks an assumption a reasonable person would make:
    maximum annualized wage is $1.47 billion and the mean is $428,938 against a
    median of $118,248. After repair the mean is $130,848.
 9. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
-   H-1B1 Chile, and H-1B1 Singapore — roughly 3% of rows.
+   H-1B1 Chile, and H-1B1 Singapore — roughly 3% of rows. All of them are
+   loaded: they are filed on the same form under the same wage rules, and the
+   `visa_class` column lets you exclude them if you disagree.
 10. **`PREVAILING_WAGE` has the same unit defect, and it is worse.** Nine
     certified filings carry an annual figure labelled `Week` or `Hour`, putting
     the maximum prevailing wage at $360,056,320. Four of them pair it with a
@@ -115,6 +117,15 @@ one breaks an assumption a reasonable person would make:
     no earlier than that, and three rows are not a trend line. That floor is
     `clean.EARLIEST_FISCAL_YEAR`; **change it if you swap the source files for
     a different range of years.**
+12. **The database has to fit in 100 MB.** GitHub refuses any file above that,
+    and `data/h1b.db` is committed so the deployed dashboard needs no
+    credentials. The planned three-table schema, with `job_title` stored inline
+    and wages as `REAL`, measured 148 MB — unpushable. Lookup tables for job
+    title, employer, occupation, location and visa class; integer wages; the
+    case-number serial used as the rowid; and indexes only on the two columns
+    queries filter on bring it to 78 MB. No rows were dropped to get there —
+    all 850,321 filings are loaded, and the `v_filings` view joins it back
+    together with the case number reassembled.
 
 ## Running locally
 
