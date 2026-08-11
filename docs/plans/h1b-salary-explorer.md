@@ -187,9 +187,9 @@ A second file, `tests/test_pipeline_numbers.py`, asserts the figures the README 
 ### Step 6 — Database schema and loader
 **Files:** `src/load.py`, produces `data/h1b.db`
 
-Three-table normalized schema (see §6). `load.py` creates tables, inserts cleaned data, creates indexes, and is **idempotent** — re-running it drops and rebuilds rather than duplicating rows.
+Six-table normalized schema (see §6). `load.py` creates tables, inserts cleaned data, creates indexes, and is **idempotent** — it builds into a scratch file and renames that over `h1b.db` only once the load is complete, so re-running never duplicates rows and a failed run leaves the previous database intact.
 
-After loading, run `VACUUM` to shrink the file. Then check size: if `h1b.db` exceeds ~200 MB, drop unused source columns rather than fighting git.
+After loading, run `VACUUM` to shrink the file. Then check size: **the file must stay under 100 MB, which is GitHub's hard limit for a single file.** There is no negotiating with it and no warning before the push is rejected.
 
 **Done when:** `python -m src.load` builds `data/h1b.db` from scratch in one command, `SELECT COUNT(*) FROM filings` matches the cleaned row count, and running it twice produces an identical file size.
 
