@@ -102,6 +102,62 @@ def test_building_twice_produces_an_identical_file(tmp_path):
     assert first[0].read_bytes() == first[1].read_bytes()
 
 
+def test_a_failed_build_leaves_the_previous_database_untouched(tmp_path, monkeypatch):
+    """Writing in place replaces a good file with a valid-looking empty one.
+
+    That is the worst shape a failure can take here: a dashboard reading it
+    renders "no results" rather than an error, so nobody finds out.
+    """
+    path = tmp_path / "h1b.db"
+    load.build(cleaned(CASE_NUMBER=["I-200-25001-00000%d" % i for i in (1, 2)]), path)
+    before = path.read_bytes()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("simulated failure partway through the load")
+
+    monkeypatch.setattr(load, "split_case_number", fail)
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        load.build(cleaned(CASE_NUMBER=["I-200-25001-000003"]), path)
+
+    assert path.read_bytes() == before
+    connection = load.connect(path)
+    assert connection.execute("SELECT COUNT(*) FROM filings").fetchone()[0] == 2
+    connection.close()
+
+
+def test_a_failed_build_leaves_no_scratch_files_behind(tmp_path, monkeypatch):
+    monkeypatch.setattr(load, "split_case_number", lambda *a, **k: 1 / 0)
+    with pytest.raises(ZeroDivisionError):
+        load.build(cleaned(), tmp_path / "h1b.db")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_concurrent_builds_do_not_corrupt_the_database(tmp_path):
+    """Each build writes to its own scratch name, so the last rename wins."""
+    import threading
+
+    path = tmp_path / "h1b.db"
+    frame = cleaned(CASE_NUMBER=["I-200-25001-00000%d" % i for i in (1, 2, 3)])
+    errors: list[Exception] = []
+
+    def go():
+        try:
+            load.build(frame, path)
+        except Exception as exc:  # noqa: BLE001 - the point is to see any of them
+            errors.append(exc)
+
+    threads = [threading.Thread(target=go) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    connection = load.connect(path)
+    assert connection.execute("SELECT COUNT(*) FROM filings").fetchone()[0] == 3
+    connection.close()
+
+
 def test_the_schema_is_internally_consistent(db):
     connection, _, _ = db
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []

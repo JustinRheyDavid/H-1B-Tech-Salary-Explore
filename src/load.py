@@ -8,26 +8,30 @@ cannot be pushed at all.
 
 So the text columns become lookup tables and the numbers become integers:
 
-===========================================  ========
-schema                                          size
-===========================================  ========
-plan's §6 three tables, wages as REAL           148 MB
-+ job_title lookup table                        119 MB
-+ city/location and integer wages and flags      96 MB
-+ case number split into prefix and serial       87 MB
-===========================================  ========
+==============================================  ========
+schema                                              size
+==============================================  ========
+plan's §6 three tables, wages as REAL              148 MB
++ job_title lookup table                           119 MB
++ location/visa lookups, integer wages and flags    96 MB
++ case serial as the rowid instead of UNIQUE        83 MB
++ indexes only on the columns queries filter on     78 MB
+==============================================  ========
 
-Every one of those was measured, not estimated. Rows are never dropped to hit
-the number — all 850,321 cleaned filings are loaded.
+Each row was measured on the full dataset, and the last one is the file that
+ships. The indexes were the surprise: at 850,321 rows they cost about 9 MB
+each, and ``dbstat`` showed them taking 69 MB of a 126 MB file — more than the
+data. Rows are never dropped to hit the number; all 850,321 filings are loaded.
 
-Running this twice produces the same file: the tables are dropped and rebuilt
-rather than appended to, so there is no partial-load state to reason about.
+Running this twice produces a byte-identical file.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 
@@ -219,9 +223,13 @@ def build(
 ) -> tuple[Path, pd.Series]:
     """Create ``path`` from cleaned filings. Returns the path and stage counts.
 
-    Idempotent by deletion: the file is replaced, not updated. Re-running after
-    a crash cannot leave half a load behind, which is the only failure mode a
-    dashboard reading this file would have no way to detect.
+    Built under a unique scratch name and renamed over ``path`` only once it is
+    complete, the same way :func:`ingest._build` writes the Parquet cache and
+    for the same reason. Writing in place is the tempting version and it is
+    wrong twice over: a failure partway through replaces a good database with
+    a structurally valid empty one, which a dashboard renders as "no results"
+    rather than an error, and two concurrent builds leave a file with no
+    ``filings`` table at all.
     """
     if frame is None:
         raw = ingest.load_all(RAW_DIR, INTERIM_DIR, clean.SOURCE_COLUMNS)
@@ -233,8 +241,24 @@ def build(
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.unlink(missing_ok=True)
+    # Unique per call: the process id alone is not enough, because threads in
+    # one process share it.
+    scratch = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
 
+    try:
+        _write(cleaned, scratch)
+        scratch.replace(path)  # atomic; the old file survives until this line
+    finally:
+        # No journal to clean up alongside it: closing the connection removes
+        # SQLite's, and a crash hard enough to strand one would not run this
+        # either. .gitignore covers the stragglers.
+        scratch.unlink(missing_ok=True)
+
+    return path, counts
+
+
+def _write(cleaned: pd.DataFrame, path: Path) -> None:
+    """Create the schema at ``path`` and fill it. Assumes nothing exists there."""
     connection = connect(path)
     try:
         connection.executescript(SCHEMA)
@@ -282,11 +306,11 @@ def build(
 
     # VACUUM cannot run inside the transaction above, and needs its own
     # connection because the schema script leaves one open implicitly.
-    with sqlite3.connect(path) as vacuum:
+    vacuum = sqlite3.connect(path)
+    try:
         vacuum.execute("VACUUM")
-    vacuum.close()
-
-    return path, counts
+    finally:
+        vacuum.close()
 
 
 def summarize(path: Path = DB_PATH) -> str:
@@ -314,7 +338,8 @@ def summarize(path: Path = DB_PATH) -> str:
 def main() -> None:
     path, counts = build()
     print("Rows discarded between the source files and the database:")
-    print(counts.to_string().replace("\n", "\n  ").rjust(2))
+    for line in counts.to_string().splitlines():
+        print(f"  {line}")
     print(f"\nBuilt {path}:")
     print(summarize(path))
 
