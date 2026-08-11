@@ -15,11 +15,23 @@ schema looks the way it does.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from src import clean, load
+
+# Resolved from this file, not the working directory. A relative path makes
+# the size check below skip itself with "no database built yet" whenever
+# pytest runs from anywhere but the repository root — silently dropping the
+# one test that guards a constraint which breaks a push with no warning.
+DATABASE = Path(__file__).resolve().parent.parent / "data" / "h1b.db"
+
+# GitHub refuses a single file above this. It is the constraint the whole
+# schema is shaped around, so it gets a test rather than only a comment.
+# Stated in MB against GitHub's 100 MiB, which leaves 4.9% of headroom.
+GITHUB_FILE_LIMIT_MB = 100
 
 DEFAULTS: dict[str, object] = {
     "CASE_NUMBER": "I-200-25001-000001",
@@ -283,6 +295,136 @@ def test_all_visa_classes_are_loaded(tmp_path):
 # --------------------------------------------------------------------------
 
 
+def test_connecting_to_a_database_that_is_not_there_raises(tmp_path):
+    """sqlite3.connect would create an empty one and report success.
+
+    Every reader of this file — queries.py, the dashboard — would then see a
+    database with no tables rather than a missing build, and the empty file
+    left behind makes the next existence check pass.
+    """
+    missing = tmp_path / "h1b.db"
+    with pytest.raises(FileNotFoundError, match="python -m src.load"):
+        load.connect(missing)
+    assert not missing.exists(), "the failed connect left a file behind"
+
+
+def test_summarizing_a_database_that_is_not_there_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load.summarize(tmp_path / "h1b.db")
+
+
+def test_a_directory_where_the_database_should_be_says_so(tmp_path):
+    directory = tmp_path / "h1b.db"
+    directory.mkdir()
+    with pytest.raises(IsADirectoryError, match="not a database file"):
+        load.connect(directory)
+
+
+def test_a_file_that_is_not_a_database_is_rejected(tmp_path):
+    impostor = tmp_path / "h1b.db"
+    impostor.write_text("this is not a database")
+    with pytest.raises(sqlite3.DatabaseError, match="wrong file header"):
+        load.connect(impostor)
+
+
+def test_a_truncated_database_is_rejected_before_the_first_query(tmp_path):
+    """What an interrupted clone of a 78 MB committed file looks like.
+
+    Without the header check this opens fine and fails mid-query with
+    "database disk image is malformed", inside whatever the dashboard was
+    rendering at the time.
+    """
+    path = tmp_path / "h1b.db"
+    load.build(cleaned(CASE_NUMBER=["I-200-25001-00000%d" % i for i in (1, 2)]), path)
+    whole = path.read_bytes()
+    path.write_bytes(whole[: len(whole) // 2])
+
+    with pytest.raises(sqlite3.DatabaseError, match="truncated"):
+        load.connect(path)
+
+
+def test_an_intact_database_is_not_mistaken_for_a_truncated_one(db):
+    """The size check only applies when SQLite says the header page count is
+    current, so it must never fire on a file this module just wrote."""
+    _, path, _ = db
+    load.connect(path).close()
+    assert path.stat().st_size > 0
+
+
+def test_truncation_is_detected_whatever_the_page_size(tmp_path):
+    """The page size is read from the header, not assumed to be the 4096 default.
+
+    Hard-coding 4096 makes ``expected`` four times too small for a 16 KB-page
+    database, so a file cut in half still looks larger than expected and the
+    truncation goes unnoticed.
+    """
+    path = tmp_path / "big_pages.db"
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA page_size = 16384")
+    connection.execute("CREATE TABLE t (x)")
+    connection.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(5_000)])
+    connection.commit()
+    connection.close()
+
+    whole = path.read_bytes()
+    assert int.from_bytes(whole[16:18], "big") == 16384, "page size did not take"
+    path.write_bytes(whole[: len(whole) // 2])
+
+    with pytest.raises(sqlite3.DatabaseError, match="truncated"):
+        load.connect(path)
+
+
+def test_a_database_with_trailing_bytes_is_still_accepted(tmp_path):
+    """Bigger than the header says is fine; only smaller means data is missing.
+
+    SQLite reads such a file perfectly well, so rejecting it on an exact-size
+    mismatch would refuse a working database — the failure this check must
+    never produce.
+    """
+    path = tmp_path / "h1b.db"
+    load.build(cleaned(CASE_NUMBER=["I-200-25001-000001"]), path)
+    with path.open("ab") as handle:
+        handle.write(b"\x00" * 1_000)
+
+    connection = load.connect(path)
+    assert connection.execute("SELECT COUNT(*) FROM filings").fetchone()[0] == 1
+    connection.close()
+
+
+def test_the_default_paths_do_not_depend_on_the_working_directory():
+    """``python -m src.load`` must build the same file from any directory.
+
+    A relative default resolves against the caller's cwd, so running it from
+    elsewhere writes the database somewhere else entirely.
+    """
+    repository = Path(__file__).resolve().parent.parent
+    assert load.DB_PATH == repository / "data" / "h1b.db"
+    assert load.RAW_DIR == repository / "data" / "raw"
+    assert load.INTERIM_DIR == repository / "data" / "interim"
+    for constant in (load.DB_PATH, load.RAW_DIR, load.INTERIM_DIR):
+        assert constant.is_absolute(), constant
+
+
+def test_a_stale_header_page_count_is_ignored_rather_than_trusted(tmp_path):
+    """Bytes 28-31 only mean something when 24-27 match 92-95.
+
+    Trusting them unconditionally rejects valid databases written by older
+    SQLite versions, which is a worse failure than the truncation this check
+    exists to catch: it would refuse a file that works.
+    """
+    path = tmp_path / "h1b.db"
+    load.build(cleaned(CASE_NUMBER=["I-200-25001-000001"]), path)
+    raw = bytearray(path.read_bytes())
+
+    raw[28:32] = (10_000_000).to_bytes(4, "big")  # claim a far larger database
+    raw[92:96] = (int.from_bytes(raw[24:28], "big") + 1).to_bytes(4, "big")
+    path.write_bytes(raw)
+
+    connection = load.connect(path)  # must not raise: the count is not current
+    assert connection.execute("SELECT COUNT(*) FROM filings").fetchone()[0] == 1
+    connection.close()
+
+
 def test_foreign_keys_are_actually_enforced(db):
     """SQLite ignores REFERENCES unless asked, per connection, every time."""
     connection, _, _ = db
@@ -320,6 +462,22 @@ def test_wages_are_stored_as_whole_dollar_integers(db):
             )
         }
         assert stored <= {"integer", "null"}, f"{column} stored as {stored}"
+
+
+@pytest.mark.skipif(
+    not DATABASE.is_file(), reason=f"{DATABASE} does not exist; run python -m src.load"
+)
+def test_the_committed_database_still_fits_on_github():
+    """The push is rejected outright above 100 MB, with no warning beforehand.
+
+    Fails while there is still something to do about it — dropping an index,
+    moving a column to a lookup table — rather than at ``git push``.
+    """
+    size_mb = DATABASE.stat().st_size / 1e6
+    assert size_mb < GITHUB_FILE_LIMIT_MB, (
+        f"{DATABASE.name} is {size_mb:.1f} MB, over GitHub's "
+        f"{GITHUB_FILE_LIMIT_MB} MB limit; see the size table in src/load.py"
+    )
 
 
 def test_rebuilding_over_an_existing_file_replaces_it(tmp_path):

@@ -8,20 +8,21 @@ cannot be pushed at all.
 
 So the text columns become lookup tables and the numbers become integers:
 
-==============================================  ========
-schema                                              size
-==============================================  ========
-plan's §6 three tables, wages as REAL              148 MB
-+ job_title lookup table                           119 MB
-+ location/visa lookups, integer wages and flags    96 MB
-+ case serial as the rowid instead of UNIQUE        83 MB
-+ indexes only on the columns queries filter on     78 MB
-==============================================  ========
+==================================================  ========
+schema                                                  size
+==================================================  ========
+plan's §6: three tables, job_title inline, REAL wages   148.0 MB
+this schema, but case_serial UNIQUE and six indexes     122.6 MB
++ case_serial as the rowid instead of a UNIQUE column   118.4 MB
++ indexes only on the two columns queries filter on      78.3 MB
+==================================================  ========
 
-Each row was measured on the full dataset, and the last one is the file that
-ships. The indexes were the surprise: at 850,321 rows they cost about 9 MB
-each, and ``dbstat`` showed them taking 69 MB of a 126 MB file — more than the
-data. Rows are never dropped to hit the number; all 850,321 filings are loaded.
+Measured on all 850,321 filings, each row differing from the one above it by
+one decision, and the last row is the file that ships. The indexes were the
+surprise: ``dbstat`` showed them holding 69 MB of a 126 MB file — more than
+the data they point at. At this row count each one costs about 9 MB, so the
+three that no query filters on were removed. Rows are never dropped to hit the
+number; all 850,321 filings are loaded.
 
 Running this twice produces a byte-identical file.
 """
@@ -37,11 +38,25 @@ import pandas as pd
 
 from src import clean, ingest
 
-__all__ = ["SCHEMA", "build", "connect", "summarize"]
+__all__ = [
+    "SCHEMA",
+    "build",
+    "connect",
+    "main",
+    "split_case_number",
+    "summarize",
+]
 
-DB_PATH = Path("data/h1b.db")
-RAW_DIR = Path("data/raw")
-INTERIM_DIR = Path("data/interim")
+# The first 16 bytes of every SQLite file, terminator included.
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+# Anchored to this file, not the working directory. Relative defaults make
+# `python -m src.load` write data/h1b.db under wherever it happened to be run
+# from, which fails loudly when data/raw is missing and silently when it is not.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = _REPO_ROOT / "data" / "h1b.db"
+RAW_DIR = _REPO_ROOT / "data" / "raw"
+INTERIM_DIR = _REPO_ROOT / "data" / "interim"
 
 # One row per distinct key, referenced by integer id from ``filings``.
 # (table, id column, key columns, payload carried alongside the key)
@@ -158,8 +173,8 @@ LEFT JOIN locations l ON l.location_id  = f.location_id;
 """
 
 
-def connect(path: Path = DB_PATH) -> sqlite3.Connection:
-    """Open ``path`` with foreign keys enforced.
+def _open(path: Path) -> sqlite3.Connection:
+    """Connect, creating the file if absent, with foreign keys enforced.
 
     SQLite ignores ``REFERENCES`` unless asked, per connection, every time.
     A schema whose constraints are decorative is worse than one without them.
@@ -167,6 +182,63 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+def _check_usable(path: Path) -> None:
+    """Reject anything that is not an intact SQLite database, before opening it.
+
+    Read from the 100-byte header, so the cost does not depend on the size of
+    the file. ``PRAGMA quick_check`` would be thorough and would scan all 78 MB
+    on every connection, which is the wrong trade for a dashboard.
+
+    This catches the two failures that reach a reader of a database committed
+    to a repository: it was never built, and the clone or transfer truncated
+    it. Corruption in the middle of an otherwise complete file still surfaces
+    at query time as ``database disk image is malformed``.
+    """
+    if path.is_dir():
+        raise IsADirectoryError(f"{path} is a directory, not a database file")
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path} does not exist. Build it with: python -m src.load"
+        )
+
+    with path.open("rb") as handle:
+        header = handle.read(100)
+    if header[:16] != _SQLITE_MAGIC:
+        raise sqlite3.DatabaseError(
+            f"{path} is not a SQLite database (wrong file header)"
+        )
+
+    # Bytes 28-31 hold the database size in pages, but only when the change
+    # counter matches the version-valid-for number; otherwise it was written by
+    # an older SQLite and means nothing. Checking that first is what keeps this
+    # from rejecting perfectly good files.
+    page_size = int.from_bytes(header[16:18], "big") or 65_536
+    if header[24:28] == header[92:96]:
+        expected = page_size * int.from_bytes(header[28:32], "big")
+        actual = path.stat().st_size
+        if actual < expected:
+            raise sqlite3.DatabaseError(
+                f"{path} is truncated: {actual:,} bytes on disk, {expected:,} "
+                "in its header. Re-clone, or rebuild with python -m src.load"
+            )
+
+
+def connect(path: Path = DB_PATH) -> sqlite3.Connection:
+    """Open an existing, intact database. Raises rather than papering over.
+
+    ``sqlite3.connect`` creates an empty file rather than failing, which is the
+    wrong default for every reader of this database. A mistyped path or a
+    missing build then yields a valid connection to a database with no tables,
+    the dashboard shows "no results" instead of an error, and the empty file
+    left behind makes the next "does it exist?" check pass. Same failure shape
+    :func:`build` writes to a scratch file to avoid, arriving by a different
+    route.
+    """
+    path = Path(path)
+    _check_usable(path)
+    return _open(path)
 
 
 def split_case_number(numbers: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -259,7 +331,7 @@ def build(
 
 def _write(cleaned: pd.DataFrame, path: Path) -> None:
     """Create the schema at ``path`` and fill it. Assumes nothing exists there."""
-    connection = connect(path)
+    connection = _open(path)
     try:
         connection.executescript(SCHEMA)
 
