@@ -326,7 +326,46 @@ def build(
         # either. .gitignore covers the stragglers.
         scratch.unlink(missing_ok=True)
 
+    _verify(path, len(cleaned))
     return path, counts
+
+
+def _verify(path: Path, expected: int) -> None:
+    """Re-open the finished file and count it, before calling the build a success.
+
+    The write is already checked before the rename, so this looks redundant and
+    is not: it is the only thing standing between the destination and whatever
+    else touches it. A file-sync client that uploads and evicts, an editor
+    holding a handle, a filesystem that does not implement rename the way the
+    rename says — each leaves a small, structurally valid, *empty* database
+    where a 78 MB one was written, and the build prints "Built ..." over it.
+
+    Reported here rather than left to the caller because the loader is the only
+    place that knows what the file was supposed to contain.
+    """
+    trouble = (
+        "The file changed between the rename and this check, so something "
+        "outside this process is touching it. A sync client (iCloud Drive, "
+        "OneDrive, Dropbox) on the containing folder is the usual cause; the "
+        "README says not to keep the repository inside one."
+    )
+    try:
+        connection = connect(path)
+        try:
+            loaded = connection.execute("SELECT COUNT(*) FROM filings").fetchone()[0]
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError) as exc:
+        # "no such table: filings" is the shape this takes in practice: the
+        # destination ends up a valid but empty database rather than a broken
+        # one, so it opens cleanly and simply has nothing in it.
+        raise RuntimeError(f"{path} is not readable after the build. {trouble}") from exc
+
+    if loaded != expected:
+        raise RuntimeError(
+            f"{path} holds {loaded:,} filings but {expected:,} were written. "
+            + trouble
+        )
 
 
 def _write(cleaned: pd.DataFrame, path: Path) -> None:
