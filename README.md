@@ -20,7 +20,7 @@ between fiscal years. Cleaning it is most of the work.
 
 ## Status
 
-Build in progress. Steps 1-6 of 10 complete — see
+Build in progress. Steps 1-7 of 10 complete — see
 [`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md)
 for the full plan.
 
@@ -30,7 +30,7 @@ for the full plan.
 - [x] 4. Cleaning module
 - [x] 5. Tests
 - [x] 6. Database schema and loader
-- [ ] 7. Query layer
+- [x] 7. Query layer
 - [ ] 8. Streamlit dashboard
 - [ ] 9. Deploy
 - [ ] 10. Documentation

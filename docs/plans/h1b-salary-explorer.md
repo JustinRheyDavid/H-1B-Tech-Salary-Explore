@@ -208,7 +208,15 @@ One named function per dashboard question, each returning a DataFrame. Minimum s
 
 Write real SQL here — `GROUP BY`, `HAVING`, `JOIN`, and at least one window function (`salary_trend` with a `LAG` for year-over-year delta is the natural fit). Parameterize every query with `?` placeholders; never f-string user input into SQL. This file is the SQL certificate's exhibit — make it readable.
 
-**Done when:** every function runs against `h1b.db` from a plain Python REPL and returns non-empty results for `("Data Analyst", "Austin", "TX")`, and no query takes over 1 second.
+> **Corrected after Step 7 was built.** Two things this section assumed turned out not to hold.
+>
+> **Query the base tables, not `v_filings`.** §6 said the opposite, and it was wrong: matching a job title case-insensitively against the joined view takes 156 ms, where resolving it through `titles` and filtering on the indexed `title_id` takes 7 ms. The view stays, for reading rows by hand. The explicit `JOIN`s are also what this step asked to demonstrate.
+>
+> **Titles must match case-insensitively.** 3,587 filings say `Data Analyst` and 777 say `DATA ANALYST`; an exact match loses 17% of them.
+>
+> **The unfiltered case cannot meet the 1-second bar, and no index fixes it.** Ranking all 850,321 rows costs 0.7–1.6 s because SQLite sorts for a window function whether or not an index could supply the order — four covering indexes on `annual_wage` were measured at **+58 MB for no improvement**. With any job title selected every function answers in 8–130 ms, so `queries.DEFAULT_JOB_TITLE` exists and Step 8's sidebar must open with it set.
+
+**Done when:** every function runs against `h1b.db` from a plain Python REPL and returns non-empty results for `("Data Analyst", "Austin", "TX")`, and no query with a job title selected takes over 1 second.
 
 ---
 
@@ -267,7 +275,7 @@ SQLite. Six tables, normalized enough to justify joins without being academic ab
 > text said "if `h1b.db` exceeds ~200 MB, drop unused source columns", which is
 > a threshold above the one that actually blocks you. The schema below is what
 > `src/load.py` builds: 78 MB with all 850,321 filings and no columns dropped.
-> `queries.py` should be written against `v_filings`, not the raw tables.
+> `queries.py` filters the base tables and uses `v_filings` only for row-level inspection; see the note in Step 7.
 
 ```sql
 CREATE TABLE employers (
@@ -329,7 +337,8 @@ CREATE TABLE filings (
 CREATE INDEX idx_filings_title    ON filings(title_id);
 CREATE INDEX idx_filings_location ON filings(location_id);
 
--- Everything joined, case number reassembled. Query this, not the tables.
+-- Everything joined, case number reassembled. For reading rows by hand;
+-- queries.py filters the base tables directly, which is 20x faster.
 CREATE VIEW v_filings AS ...;               -- see src/load.py for the body
 ```
 
