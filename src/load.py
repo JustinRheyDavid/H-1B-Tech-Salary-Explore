@@ -238,7 +238,23 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     """
     path = Path(path)
     _check_usable(path)
-    return _open(path)
+    connection = _open(path)
+
+    # The header check cannot see this: a database that was created and never
+    # filled is structurally perfect and completely empty. It is also the shape
+    # a half-finished or interrupted build leaves behind, so it is the one a
+    # reader is most likely to meet. Without this the failure surfaces later as
+    # "no such table: filings" with a page of SQL attached.
+    try:
+        connection.execute("SELECT 1 FROM filings LIMIT 1")
+    except sqlite3.DatabaseError as exc:
+        connection.close()
+        raise sqlite3.DatabaseError(
+            f"{path} has no filings table, so it is not this project's "
+            "database or the build did not finish. Rebuild it with: "
+            "python -m src.load"
+        ) from exc
+    return connection
 
 
 def split_case_number(numbers: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -286,7 +302,8 @@ def _write_lookup(
 
     ids = frame[keys].merge(values[[*keys, id_column]], on=keys, how="left")
     if ids[id_column].isna().any():
-        raise RuntimeError(f"{table}: {int(ids[id_column].isna().sum())} rows unmatched")
+        unmatched = int(ids[id_column].isna().sum())
+        raise RuntimeError(f"{table}: {unmatched} rows unmatched")
     return pd.Series(ids[id_column].to_numpy(), index=frame.index).astype("int64")
 
 
@@ -359,7 +376,9 @@ def _verify(path: Path, expected: int) -> None:
         # "no such table: filings" is the shape this takes in practice: the
         # destination ends up a valid but empty database rather than a broken
         # one, so it opens cleanly and simply has nothing in it.
-        raise RuntimeError(f"{path} is not readable after the build. {trouble}") from exc
+        raise RuntimeError(
+            f"{path} is not readable after the build. {trouble}"
+        ) from exc
 
     if loaded != expected:
         raise RuntimeError(
@@ -435,10 +454,11 @@ def summarize(path: Path = DB_PATH) -> str:
                 "AND name NOT LIKE 'sqlite_%' ORDER BY name"
             )
         ]
-        lines = [
-            f"  {table:<14} {connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]:>9,}"
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ]
+        }
+        lines = [f"  {table:<14} {count:>9,}" for table, count in counts.items()]
     finally:
         connection.close()
     size = Path(path).stat().st_size / 1e6

@@ -13,6 +13,7 @@ on purpose.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from src import clean, load, queries
+from tests.test_load import cleaned
 from tests.test_queries import DEFAULTS
 
 # Absolute: AppTest.from_file resolves a relative path against the file that
@@ -251,9 +253,43 @@ def test_each_section_says_so_rather_than_drawing_nothing(app, section, monkeypa
 # --------------------------------------------------------------------------
 
 
-def test_a_missing_database_is_a_message_not_a_traceback(tmp_path, monkeypatch):
-    monkeypatch.setattr(queries, "DB_PATH", tmp_path / "absent.db")
+def _broken(kind: str, folder: Path) -> Path:
+    """One of the four ways this database reaches a reader unusable."""
+    path = folder / "h1b.db"
+    if kind == "missing":
+        return path
+    if kind == "a directory":
+        path.mkdir()
+    elif kind == "not a database":
+        path.write_text("hello")
+    elif kind == "valid but empty":
+        # What an interrupted build leaves: structurally perfect, no tables.
+        connection = sqlite3.connect(path)
+        connection.execute("VACUUM")
+        connection.close()
+    elif kind == "truncated":
+        load.build(cleaned(CASE_NUMBER=["I-200-25001-000001"]), path)
+        whole = path.read_bytes()
+        path.write_bytes(whole[: len(whole) // 2])
+    return path
+
+
+@pytest.mark.parametrize(
+    "kind", ["missing", "a directory", "not a database", "valid but empty", "truncated"]
+)
+def test_an_unusable_database_is_a_message_not_a_traceback(tmp_path, monkeypatch, kind):
+    """All four failures, not just the missing file.
+
+    "valid but empty" is the one that actually happened on a real machine, and
+    "truncated" is what an incomplete clone of the committed 78 MB file looks
+    like. Both used to reach the browser as a pandas traceback with the SQL in
+    it — the exact thing Step 8 says must not happen.
+    """
+    monkeypatch.setattr(queries, "DB_PATH", _broken(kind, tmp_path))
     test = AppTest.from_file(APP, default_timeout=90)
     test.run()
-    assert not test.exception
-    assert any("database is missing" in m.lower() for m in messages(test))
+
+    assert not test.exception, test.exception
+    said = " ".join(messages(test)).lower()
+    assert "database" in said
+    assert "select" not in said, "the SQL leaked into the message"

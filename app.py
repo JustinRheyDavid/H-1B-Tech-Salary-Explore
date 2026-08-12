@@ -19,6 +19,8 @@ empty state.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -225,21 +227,16 @@ def footer() -> None:
     )
 
 
-def main() -> None:
-    st.title("H-1B Tech Salary Explorer")
-    st.caption(
-        "850,321 tech filings from US Department of Labor wage disclosures, "
-        "cleaned and normalized to annual USD."
-    )
+# Every way the database can fail a reader. `load.connect` raises all of these
+# with a message that already says what to do, so they are shown as written
+# rather than translated. pandas wraps a failed query in its own DatabaseError
+# and pastes the SQL into the message, which is the one case worth replacing.
+DATABASE_TROUBLE = (FileNotFoundError, IsADirectoryError, sqlite3.DatabaseError)
 
-    try:
-        filters = sidebar()
-    except FileNotFoundError as missing:
-        # The one failure a visitor can neither fix nor understand from a
-        # traceback: the committed database is not where it should be.
-        st.error(f"The database is missing. {missing}")
-        return
 
+def page() -> None:
+    """The whole dashboard. Raises if the database cannot answer."""
+    filters = sidebar()
     count = headline(filters)
     if count == 0:
         st.warning(
@@ -258,6 +255,27 @@ def main() -> None:
     employers_table(filters)
     cities_table(filters)
     footer()
+
+
+def main() -> None:
+    st.title("H-1B Tech Salary Explorer")
+    st.caption(
+        "850,321 tech filings from US Department of Labor wage disclosures, "
+        "cleaned and normalized to annual USD."
+    )
+
+    try:
+        page()
+    except DATABASE_TROUBLE as trouble:
+        # Around the whole page, not just the first query: a visitor cannot act
+        # on a traceback, and this is the failure they are most likely to meet
+        # — a clone that transferred the 78 MB database incompletely.
+        st.error(f"The database cannot be read. {trouble}")
+    except pd.errors.DatabaseError:
+        st.error(
+            "The database could not answer that query. It may be incomplete — "
+            "rebuild it with `python -m src.load`."
+        )
 
 
 if __name__ == "__main__":
