@@ -51,11 +51,7 @@ trend = _cache(queries.salary_trend)
 titles = _cache(queries.title_search)
 
 
-@st.cache_data(show_spinner=False)
-def fiscal_years() -> list[int]:
-    """Years present in the data, newest first, for the year picker."""
-    years = trend(queries.DEFAULT_JOB_TITLE)["fiscal_year"]
-    return sorted((int(year) for year in years), reverse=True)
+fiscal_years = _cache(queries.fiscal_years)
 
 
 def money(value: float | None) -> str:

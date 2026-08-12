@@ -141,6 +141,26 @@ def test_every_section_draws_when_there_is_data(app):
     assert len(test.get("plotly_chart")) == 2
 
 
+def test_the_year_picker_offers_every_year_in_the_data(tmp_path, monkeypatch):
+    """Not just the years the default job title happens to have filings in."""
+    frame = cleaned(
+        CASE_NUMBER=[f"I-200-25001-{i:06d}" for i in range(1, 4)],
+        JOB_TITLE=["Bioinformatics Scientist"] * 3,
+        DECISION_DATE=["2024-05-01", "2025-05-01", "2026-01-15"],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0, 110_000.0, 120_000.0],
+    )
+    path, _ = load.build(frame, tmp_path / "h1b.db")
+    monkeypatch.setattr(queries, "DB_PATH", path)
+
+    test = AppTest.from_file(APP, default_timeout=90)
+    test.run()
+    assert not test.exception
+    years = next(s for s in test.selectbox if s.label == "Fiscal year")
+    # AppTest reports options as the strings Streamlit displays, not the
+    # values the app passed in.
+    assert list(years.options) == ["All years", "2026", "2025", "2024"]
+
+
 def test_the_footer_says_what_the_data_is_and_is_not(app):
     captions = " ".join(c.value for c in app().caption)
     assert "Department of Labor" in captions

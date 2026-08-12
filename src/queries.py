@@ -48,6 +48,7 @@ from src.load import DB_PATH, connect
 
 __all__ = [
     "DEFAULT_JOB_TITLE",
+    "fiscal_years",
     "wage_distribution",
     "salary_percentiles",
     "top_employers",
@@ -231,6 +232,24 @@ def salary_percentiles(
         params,
         db,
     )
+
+
+def fiscal_years(db: Path | None = None) -> list[int]:
+    """Every fiscal year in the data, newest first, for the year picker.
+
+    Read from the filings themselves rather than from one job title's trend.
+    Deriving it from :data:`DEFAULT_JOB_TITLE` gives the same three years
+    today and stops being true the moment that title changes or a quarter
+    arrives with no filings under it — leaving a filter unable to select a
+    year that exists.
+
+    About 100 ms: ``fiscal_year`` has no index, because one costs 9 MB and
+    three distinct values are not worth it. Called once and cached.
+    """
+    frame = _run(
+        "SELECT DISTINCT fiscal_year FROM filings ORDER BY fiscal_year DESC", [], db
+    )
+    return [int(year) for year in frame["fiscal_year"]]
 
 
 def wage_distribution(

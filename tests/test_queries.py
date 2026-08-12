@@ -261,6 +261,36 @@ def test_the_earliest_year_has_no_year_over_year_change(tmp_path):
     assert pd.isna(queries.salary_trend(db=db)["yoy_pct_change"].iloc[0])
 
 
+def test_fiscal_years_come_from_the_data_not_from_one_job_title(tmp_path):
+    """A year with filings but none under the default title must still appear.
+
+    Derived from ``salary_trend(DEFAULT_JOB_TITLE)`` this list silently omits
+    such a year, and is empty in a database that lacks the default title —
+    leaving the picker unable to select a year that is plainly there.
+    """
+    db = database(
+        tmp_path,
+        JOB_TITLE=["Bioinformatics Scientist"] * 3,
+        DECISION_DATE=["2024-05-01", "2025-05-01", "2026-01-15"],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0] * 3,
+    )
+    assert queries.salary_trend(queries.DEFAULT_JOB_TITLE, db=db).empty
+    assert queries.fiscal_years(db=db) == [2026, 2025, 2024]
+
+
+def test_fiscal_years_lists_each_year_once_newest_first(tmp_path):
+    """Repeats on purpose: most years have hundreds of thousands of filings."""
+    db = database(
+        tmp_path,
+        DECISION_DATE=[
+            "2026-01-15", "2024-05-01", "2025-05-01",
+            "2024-06-01", "2025-06-01", "2024-07-01",
+        ],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0] * 6,
+    )
+    assert queries.fiscal_years(db=db) == [2026, 2025, 2024]
+
+
 def test_the_trend_is_ordered_by_year(tmp_path):
     db = database(
         tmp_path,

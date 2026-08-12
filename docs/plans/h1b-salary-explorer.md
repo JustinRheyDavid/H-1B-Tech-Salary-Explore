@@ -205,6 +205,8 @@ One named function per dashboard question, each returning a DataFrame. Minimum s
 - `salary_by_city(job_title, min_filings)` — for the city comparison chart
 - `salary_trend(job_title, city)` — median by fiscal year
 - `title_search(prefix)` — autocomplete backing for the title picker
+- `wage_distribution(job_title, city, state, year, bin_width)` — **added during Step 8**, which needs a histogram no aggregate can feed. Bins in SQL: forty rows rather than 70,943 wages shipped to the browser to bucket themselves
+- `fiscal_years()` — **added during Step 8** for the year picker. Read from the filings, not from one title's trend, which silently omits a year that has filings but none under `DEFAULT_JOB_TITLE`
 
 Write real SQL here — `GROUP BY`, `HAVING`, `JOIN`, and at least one window function (`salary_trend` with a `LAG` for year-over-year delta is the natural fit). Parameterize every query with `?` placeholders; never f-string user input into SQL. This file is the SQL certificate's exhibit — make it readable.
 
@@ -227,8 +229,12 @@ Layout:
 
 - **Sidebar:** job title search, city/state, fiscal year, minimum-filings threshold, an "exclude flagged outliers" toggle (default on)
 - **Top row:** three metric cards — median, p25, p75 salary for the current filter, with filing count
-- **Main:** a salary distribution histogram, a top-employers table, a year-over-year trend line
+- **Main:** a salary distribution histogram, a top-employers table, a year-over-year trend line, and a cities table — the last one added during the build, because `salary_by_city` is otherwise built in Step 7 and never called
 - **Footer:** data source, download date, and one honest sentence on what H-1B data does and does not represent
+
+> **Two notes from the build.** The three metric cards are joined by a fourth showing the filing count, because a median means nothing without knowing how many filings it came from.
+>
+> `app.py` is tested through Streamlit's own `AppTest`, which runs the real script headlessly. The acceptance below is a claim about *every* filter combination, and that is not something to check by eye.
 
 Wrap every query call in `@st.cache_data`. Handle the empty-result case explicitly with a readable message, not a stack trace — this is the single most common way these dashboards embarrass their author in front of a recruiter.
 
@@ -367,7 +373,18 @@ salary_trend(job_title: str, city: str|None) -> DataFrame
                    # cols: fiscal_year, median_wage, n_filings, yoy_pct_change
 
 title_search(prefix: str, limit: int = 25) -> list[str]
+
+# Both added during Step 8, which needed data the five above cannot provide.
+wage_distribution(job_title: str|None, city: str|None, state: str|None,
+                  fiscal_year: int|None, include_outliers: bool = False,
+                  bin_width: int = 10_000) -> DataFrame
+                   # cols: bin_floor, n_filings
+
+fiscal_years() -> list[int]
+                   # newest first; every year in the data, not one title's
 ```
+
+Every one also takes `db: Path|None = None`, which defaults to `load.DB_PATH`. It exists so tests can point at a small database, and it is the only reason these functions are testable without the 78 MB file.
 
 ---
 
