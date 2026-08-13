@@ -238,7 +238,23 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     """
     path = Path(path)
     _check_usable(path)
-    return _open(path)
+    connection = _open(path)
+
+    # The header check cannot see this: a database that was created and never
+    # filled is structurally perfect and completely empty. It is also the shape
+    # a half-finished or interrupted build leaves behind, so it is the one a
+    # reader is most likely to meet. Without this the failure surfaces later as
+    # "no such table: filings" with a page of SQL attached.
+    try:
+        connection.execute("SELECT 1 FROM filings LIMIT 1")
+    except sqlite3.DatabaseError as exc:
+        connection.close()
+        raise sqlite3.DatabaseError(
+            f"{path} has no filings table, so it is not this project's "
+            "database or the build did not finish. Rebuild it with: "
+            "python -m src.load"
+        ) from exc
+    return connection
 
 
 def split_case_number(numbers: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -286,7 +302,8 @@ def _write_lookup(
 
     ids = frame[keys].merge(values[[*keys, id_column]], on=keys, how="left")
     if ids[id_column].isna().any():
-        raise RuntimeError(f"{table}: {int(ids[id_column].isna().sum())} rows unmatched")
+        unmatched = int(ids[id_column].isna().sum())
+        raise RuntimeError(f"{table}: {unmatched} rows unmatched")
     return pd.Series(ids[id_column].to_numpy(), index=frame.index).astype("int64")
 
 
@@ -326,7 +343,48 @@ def build(
         # either. .gitignore covers the stragglers.
         scratch.unlink(missing_ok=True)
 
+    _verify(path, len(cleaned))
     return path, counts
+
+
+def _verify(path: Path, expected: int) -> None:
+    """Re-open the finished file and count it, before calling the build a success.
+
+    The write is already checked before the rename, so this looks redundant and
+    is not: it is the only thing standing between the destination and whatever
+    else touches it. A file-sync client that uploads and evicts, an editor
+    holding a handle, a filesystem that does not implement rename the way the
+    rename says — each leaves a small, structurally valid, *empty* database
+    where a 78 MB one was written, and the build prints "Built ..." over it.
+
+    Reported here rather than left to the caller because the loader is the only
+    place that knows what the file was supposed to contain.
+    """
+    trouble = (
+        "The file changed between the rename and this check, so something "
+        "outside this process is touching it. A sync client (iCloud Drive, "
+        "OneDrive, Dropbox) on the containing folder is the usual cause; the "
+        "README says not to keep the repository inside one."
+    )
+    try:
+        connection = connect(path)
+        try:
+            loaded = connection.execute("SELECT COUNT(*) FROM filings").fetchone()[0]
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError) as exc:
+        # "no such table: filings" is the shape this takes in practice: the
+        # destination ends up a valid but empty database rather than a broken
+        # one, so it opens cleanly and simply has nothing in it.
+        raise RuntimeError(
+            f"{path} is not readable after the build. {trouble}"
+        ) from exc
+
+    if loaded != expected:
+        raise RuntimeError(
+            f"{path} holds {loaded:,} filings but {expected:,} were written. "
+            + trouble
+        )
 
 
 def _write(cleaned: pd.DataFrame, path: Path) -> None:
@@ -396,10 +454,11 @@ def summarize(path: Path = DB_PATH) -> str:
                 "AND name NOT LIKE 'sqlite_%' ORDER BY name"
             )
         ]
-        lines = [
-            f"  {table:<14} {connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]:>9,}"
+        counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in tables
-        ]
+        }
+        lines = [f"  {table:<14} {count:>9,}" for table, count in counts.items()]
     finally:
         connection.close()
     size = Path(path).stat().st_size / 1e6

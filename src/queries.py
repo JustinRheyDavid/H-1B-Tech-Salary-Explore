@@ -48,6 +48,8 @@ from src.load import DB_PATH, connect
 
 __all__ = [
     "DEFAULT_JOB_TITLE",
+    "fiscal_years",
+    "wage_distribution",
     "salary_percentiles",
     "top_employers",
     "salary_by_city",
@@ -56,8 +58,10 @@ __all__ = [
 ]
 
 # What the dashboard opens on. Any title would do; this is the most filed one,
-# at 63,491 filings. Its real job is to keep the unfiltered path — which is
-# thirty to a hundred times slower — off the first screen a visitor sees.
+# matching 70,949 filings — 63,491 spelled exactly like this and the rest under
+# other capitalisations, which is the gap the case-insensitive lookup exists to
+# close. Its real job is to keep the unfiltered path — thirty to a hundred
+# times slower — off the first screen a visitor sees.
 DEFAULT_JOB_TITLE = "Software Engineer"
 
 # Resolved through the lookup table so the index on filings(title_id) applies.
@@ -92,6 +96,11 @@ _MEDIAN = _percentile(0.50)
 # limit*, a string compared against an INTEGER column matches nothing, and a
 # non-empty string is truthy whatever it says. Each of those reads as data.
 
+# SQLite stores integers in 8 bytes; anything larger cannot be bound at all,
+# and the failure arrives from inside pandas with the whole query pasted into
+# the message. Cheaper to refuse it here and say which argument was wrong.
+_SQLITE_MAX_INT = 2**63 - 1
+
 
 def _whole_number(name: str, value: Any) -> int:
     """A count or a year. Rejects negatives, non-integers, and ``bool``.
@@ -101,25 +110,35 @@ def _whole_number(name: str, value: Any) -> int:
     negative ``LIMIT`` as no limit at all. ``fiscal_year="2025"`` matches no
     rows and reads as "nobody filed that year".
 
-    ``bool`` is excluded deliberately: it subclasses ``int``, so ``limit=True``
-    would otherwise quietly mean ``limit=1``.
+    ``pd.api.types.is_integer`` rather than ``isinstance(value, int)`` because
+    ``numpy.int64`` is not a subclass of ``int`` — and every function in this
+    module hands back a DataFrame, so ``salary_trend()["fiscal_year"].iloc[0]``
+    is exactly the value someone would feed back in. It also excludes ``bool``,
+    which *is* an ``int`` subclass and would otherwise make ``limit=True`` mean
+    ``limit=1``.
+
+    Returned as a plain ``int``: sqlite3 cannot bind a numpy scalar.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
+    if not pd.api.types.is_integer(value):
         raise TypeError(f"{name} must be a whole number, got {value!r}")
     if value < 0:
         raise ValueError(f"{name} must not be negative, got {value}")
-    return value
+    if value > _SQLITE_MAX_INT:
+        raise ValueError(f"{name} must be at most {_SQLITE_MAX_INT}, got {value}")
+    return int(value)
 
 
 def _flag(name: str, value: Any) -> bool:
     """A true/false switch, and only that.
 
     Every non-empty string is truthy, so ``include_outliers="no"`` would turn
-    the outlier filter *off* — the opposite of what it says.
+    the outlier filter *off* — the opposite of what it says. ``numpy.bool_`` is
+    accepted for the same reason numpy integers are: it comes out of a
+    DataFrame and is not a ``bool`` subclass.
     """
-    if not isinstance(value, bool):
+    if not pd.api.types.is_bool(value):
         raise TypeError(f"{name} must be True or False, got {value!r}")
-    return value
+    return bool(value)
 
 
 def _text(name: str, value: Any) -> str | None:
@@ -211,6 +230,62 @@ def salary_percentiles(
         FROM ranked
         """,
         params,
+        db,
+    )
+
+
+def fiscal_years(db: Path | None = None) -> list[int]:
+    """Every fiscal year in the data, newest first, for the year picker.
+
+    Read from the filings themselves rather than from one job title's trend.
+    Deriving it from :data:`DEFAULT_JOB_TITLE` gives the same three years
+    today and stops being true the moment that title changes or a quarter
+    arrives with no filings under it — leaving a filter unable to select a
+    year that exists.
+
+    About 100 ms: ``fiscal_year`` has no index, because one costs 9 MB and
+    three distinct values are not worth it. Called once and cached.
+    """
+    frame = _run(
+        "SELECT DISTINCT fiscal_year FROM filings ORDER BY fiscal_year DESC", [], db
+    )
+    return [int(year) for year in frame["fiscal_year"]]
+
+
+def wage_distribution(
+    job_title: str | None = None,
+    city: str | None = None,
+    state: str | None = None,
+    fiscal_year: int | None = None,
+    include_outliers: bool = False,
+    bin_width: int = 10_000,
+    db: Path | None = None,
+) -> pd.DataFrame:
+    """Filing counts per wage band, for the distribution chart.
+
+    Binned in SQL rather than handed over row by row. The alternative returns
+    70,943 wages for one common title so the browser can bucket them itself,
+    which is a lot of bytes to move in order to draw forty bars.
+
+    Columns: ``bin_floor``, ``n_filings``. A band with no filings is absent
+    rather than zero — a bar chart draws the gap either way, and inventing the
+    empty rows would mean deciding where the axis ends.
+    """
+    where, params = _where(job_title, city, state, fiscal_year, include_outliers)
+    width = _whole_number("bin_width", bin_width)
+    if width == 0:
+        raise ValueError("bin_width must not be zero")
+    return _run(
+        f"""
+        SELECT CAST(f.annual_wage / ? AS INTEGER) * ? AS bin_floor,
+               COUNT(*)                               AS n_filings
+        FROM filings f
+        JOIN locations l ON l.location_id = f.location_id
+        WHERE {where}
+        GROUP BY bin_floor
+        ORDER BY bin_floor
+        """,
+        [width, width, *params],
         db,
     )
 

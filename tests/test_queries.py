@@ -11,6 +11,7 @@ The figures from the real 850,321-row database are checked in
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -260,6 +261,36 @@ def test_the_earliest_year_has_no_year_over_year_change(tmp_path):
     assert pd.isna(queries.salary_trend(db=db)["yoy_pct_change"].iloc[0])
 
 
+def test_fiscal_years_come_from_the_data_not_from_one_job_title(tmp_path):
+    """A year with filings but none under the default title must still appear.
+
+    Derived from ``salary_trend(DEFAULT_JOB_TITLE)`` this list silently omits
+    such a year, and is empty in a database that lacks the default title —
+    leaving the picker unable to select a year that is plainly there.
+    """
+    db = database(
+        tmp_path,
+        JOB_TITLE=["Bioinformatics Scientist"] * 3,
+        DECISION_DATE=["2024-05-01", "2025-05-01", "2026-01-15"],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0] * 3,
+    )
+    assert queries.salary_trend(queries.DEFAULT_JOB_TITLE, db=db).empty
+    assert queries.fiscal_years(db=db) == [2026, 2025, 2024]
+
+
+def test_fiscal_years_lists_each_year_once_newest_first(tmp_path):
+    """Repeats on purpose: most years have hundreds of thousands of filings."""
+    db = database(
+        tmp_path,
+        DECISION_DATE=[
+            "2026-01-15", "2024-05-01", "2025-05-01",
+            "2024-06-01", "2025-06-01", "2024-07-01",
+        ],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0] * 6,
+    )
+    assert queries.fiscal_years(db=db) == [2026, 2025, 2024]
+
+
 def test_the_trend_is_ordered_by_year(tmp_path):
     db = database(
         tmp_path,
@@ -416,6 +447,59 @@ def test_a_filter_that_is_not_text_is_refused(eight_wages, kwargs):
 def test_title_search_refuses_a_prefix_that_is_not_text(eight_wages):
     with pytest.raises(TypeError, match="text or None"):
         queries.title_search(123, db=eight_wages)
+
+
+def test_values_taken_straight_back_out_of_a_returned_frame_are_accepted(tmp_path):
+    """Every function here returns a DataFrame, so its columns are numpy types.
+
+    ``numpy.int64`` is not a subclass of ``int``, so a strict isinstance check
+    rejects this module's own output — which is precisely what a year selector
+    populated from salary_trend() would hand back.
+    """
+    db = database(
+        tmp_path,
+        DECISION_DATE=["2024-05-01", "2025-05-01"],
+        WAGE_RATE_OF_PAY_FROM=[100_000.0, 110_000.0],
+    )
+    year = queries.salary_trend(db=db)["fiscal_year"].iloc[0]
+    assert type(year) is not int, "fixture no longer exercises the numpy case"
+
+    row = queries.salary_percentiles(fiscal_year=year, db=db).iloc[0]
+    assert row.n_filings == 1
+
+
+@pytest.mark.parametrize("year", [np.int64(2025), np.int32(2025), 2025])
+def test_a_numpy_integer_is_a_whole_number(tmp_path, year):
+    db = database(
+        tmp_path, DECISION_DATE=["2025-05-01"], WAGE_RATE_OF_PAY_FROM=[100_000.0]
+    )
+    assert queries.salary_percentiles(fiscal_year=year, db=db).iloc[0].n_filings == 1
+
+
+@pytest.mark.parametrize("flag", [np.bool_(True), True])
+def test_a_numpy_boolean_is_a_flag(eight_wages, flag):
+    assert queries.salary_percentiles(include_outliers=flag, db=eight_wages).iloc[
+        0
+    ].n_filings == 8
+
+
+def test_the_validators_hand_back_plain_python_types():
+    """Not decoration: sqlite3 cannot bind a numpy scalar as a parameter, and
+    the annotations would otherwise be untrue for anything out of a DataFrame.
+    """
+    assert type(queries._whole_number("limit", np.int64(20))) is int
+    assert type(queries._flag("include_outliers", np.bool_(True))) is bool
+
+
+@pytest.mark.parametrize("limit", [2**63, 10**20])
+def test_a_count_too_large_for_sqlite_is_refused(eight_wages, limit):
+    """Otherwise it fails inside pandas with the entire query in the message."""
+    with pytest.raises(ValueError, match="must be at most"):
+        queries.top_employers(limit=limit, db=eight_wages)
+
+
+def test_the_largest_integer_sqlite_can_hold_is_still_accepted(eight_wages):
+    assert len(queries.top_employers(limit=2**63 - 1, db=eight_wages)) == 1
 
 
 def test_zero_is_a_legitimate_count(eight_wages):

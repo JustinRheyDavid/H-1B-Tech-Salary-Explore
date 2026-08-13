@@ -114,6 +114,42 @@ def test_building_twice_produces_an_identical_file(tmp_path):
     assert first[0].read_bytes() == first[1].read_bytes()
 
 
+def test_a_build_whose_result_is_emptied_afterwards_is_not_reported_as_success(
+    tmp_path, monkeypatch
+):
+    """What a file-sync client does: replace the finished file with a stub.
+
+    The pre-rename check cannot see this, because at that point the database
+    was complete. Without the post-condition the loader prints "Built ..." and
+    a 0.0 MB size, which is what happened on a real machine.
+    """
+    path = tmp_path / "h1b.db"
+    real_replace = Path.replace
+
+    def replace_then_empty(self, target):
+        real_replace(self, target)
+        Path(target).unlink()
+        # A valid, small, table-less database - exactly what was found on the
+        # real machine, where summarize() opened it fine and listed no tables.
+        empty = sqlite3.connect(target)
+        empty.execute("VACUUM")
+        empty.close()
+
+    monkeypatch.setattr(Path, "replace", replace_then_empty)
+    with pytest.raises(RuntimeError, match="not readable after the build"):
+        load.build(cleaned(CASE_NUMBER=["I-200-25001-000001"]), path)
+
+
+def test_a_completed_build_passes_its_own_post_condition(tmp_path):
+    path, _ = load.build(
+        cleaned(CASE_NUMBER=["I-200-25001-00000%d" % i for i in (1, 2)]),
+        path=tmp_path / "h1b.db",
+    )
+    connection = load.connect(path)
+    assert connection.execute("SELECT COUNT(*) FROM filings").fetchone()[0] == 2
+    connection.close()
+
+
 def test_a_failed_build_leaves_the_previous_database_untouched(tmp_path, monkeypatch):
     """Writing in place replaces a good file with a valid-looking empty one.
 
@@ -306,6 +342,22 @@ def test_connecting_to_a_database_that_is_not_there_raises(tmp_path):
     with pytest.raises(FileNotFoundError, match="python -m src.load"):
         load.connect(missing)
     assert not missing.exists(), "the failed connect left a file behind"
+
+
+def test_connecting_to_a_database_with_no_filings_table_raises(tmp_path):
+    """A build that never finished leaves a structurally perfect empty file.
+
+    The header check cannot see it, and the failure otherwise surfaces at the
+    first query as "no such table: filings" with a page of SQL attached — which
+    is what a real machine produced after an interrupted build.
+    """
+    path = tmp_path / "h1b.db"
+    connection = sqlite3.connect(path)
+    connection.execute("VACUUM")
+    connection.close()
+
+    with pytest.raises(sqlite3.DatabaseError, match="no filings table"):
+        load.connect(path)
 
 
 def test_summarizing_a_database_that_is_not_there_raises(tmp_path):

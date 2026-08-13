@@ -373,7 +373,10 @@ def test_a_case_in_two_files_keeps_its_later_decision(tmp_path):
     raw.mkdir()
     # Deliberately named so alphabetical order disagrees with decision order:
     # sorting by filename alone would keep the *earlier* decision.
-    workbook(raw / "a.xlsx", [["I-200-001", "Certified - Withdrawn", "2025-04-02", "A"]])
+    workbook(
+        raw / "a.xlsx",
+        [["I-200-001", "Certified - Withdrawn", "2025-04-02", "A"]],
+    )
     workbook(raw / "b.xlsx", [["I-200-001", "Certified", "2025-03-30", "A"]])
 
     frame = ingest.load_all(raw, interim)
