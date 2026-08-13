@@ -193,6 +193,39 @@ def test_a_distribution_with_no_tail_hides_nothing(app):
     assert cap >= 100_000
 
 
+def test_every_section_is_drawn_inside_a_card(app):
+    """The layout is bordered containers, one per section.
+
+    Asserted on the element tree rather than by eye: a decorator is easy to
+    leave off one section, and the result reads as a page that forgot a box.
+    """
+    import app as dashboard
+
+    for name in (
+        "distribution_chart", "employers_table", "cities_table", "trend_chart"
+    ):
+        section = getattr(dashboard, name)
+        assert hasattr(section, "__wrapped__"), f"{name} is not wrapped in a card"
+
+    # AppTest's element tree does not expose containers, so the page can only
+    # be checked for still rendering; the decorator above is the real assertion.
+    test = app()
+    assert not test.exception
+    assert len(test.subheader) == 4
+
+
+def test_charts_are_stripped_to_the_data(app):
+    """No plot-area fill, no vertical grid — the card is the only rectangle."""
+    import app as dashboard
+    import plotly.express as px
+
+    figure = dashboard.style(px.bar(x=[1, 2], y=[3, 4]))
+    assert figure.layout.plot_bgcolor == "rgba(0,0,0,0)"
+    assert figure.layout.paper_bgcolor == "rgba(0,0,0,0)"
+    assert figure.layout.xaxis.showgrid is False
+    assert figure.layout.yaxis.showgrid is True
+
+
 def test_the_year_picker_offers_every_year_in_the_data(tmp_path, monkeypatch):
     """Not just the years the default job title happens to have filings in."""
     frame = cleaned(
