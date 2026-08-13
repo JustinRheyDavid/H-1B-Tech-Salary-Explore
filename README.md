@@ -5,8 +5,6 @@ the Department of Labor — searchable by job title, city and year.
 
 ### ▶ [Open the live dashboard](https://h-1b-tech-salary-explore-morzlyjgltmfnutdx7pa68.streamlit.app/)
 
-![The dashboard showing median, 25th and 75th percentile wages for Software Engineer, with a distribution histogram and a fiscal-year trend](docs/screenshot.png)
-
 ---
 
 ## Why this data
@@ -20,6 +18,22 @@ It is public, exact rather than banded, and genuinely messy — mixed pay units,
 inconsistent employer names, column headers that change between fiscal years,
 and 73% of the rows blank. Cleaning it is most of the work, and the
 [cleaning decisions](#data-cleaning-decisions) below are the part worth reading.
+
+## Status
+
+Complete and deployed. Built in ten steps against
+[`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md).
+
+- [x] 1. Repo skeleton and dependencies
+- [x] 2. Data acquisition
+- [x] 3. Exploration notebook
+- [x] 4. Cleaning module
+- [x] 5. Tests
+- [x] 6. Database schema and loader
+- [x] 7. Query layer
+- [x] 8. Streamlit dashboard
+- [x] 9. Deploy
+- [x] 10. Documentation
 
 ## Data sources
 
