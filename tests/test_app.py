@@ -161,10 +161,21 @@ def test_the_year_picker_offers_every_year_in_the_data(tmp_path, monkeypatch):
     assert list(years.options) == ["All years", "2026", "2025", "2024"]
 
 
-def test_the_footer_says_what_the_data_is_and_is_not(app):
-    captions = " ".join(c.value for c in app().caption)
-    assert "Department of Labor" in captions
+@pytest.mark.parametrize("filters", [{}, {"City": "Nowhere"}])
+def test_the_footer_says_what_the_data_is_and_is_not(app, filters):
+    """On the empty path too: attribution is not a reward for matching rows.
+
+    A page that found nothing is still a page carrying someone else's data,
+    and it is the one most likely to be screenshotted as "look, no results".
+    """
+    captions = " ".join(c.value for c in app(**filters).caption)
+    # "Department of Labor" alone would be satisfied by the header caption
+    # under the title, so the attribution is pinned by the office name, which
+    # appears only in the footer.
+    assert "Office of Foreign Labor Certification" in captions
+    assert "6 August 2026" in captions
     assert "not a salary survey" in captions
+    assert "record what was offered rather than what was ultimately paid" in captions
 
 
 # --------------------------------------------------------------------------
