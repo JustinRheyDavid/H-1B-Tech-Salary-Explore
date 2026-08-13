@@ -19,6 +19,7 @@ empty state.
 
 from __future__ import annotations
 
+import functools
 import sqlite3
 
 import pandas as pd
@@ -52,6 +53,44 @@ titles = _cache(queries.title_search)
 
 
 fiscal_years = _cache(queries.fiscal_years)
+
+
+def _card(section):
+    """Draw a section inside a bordered container.
+
+    A decorator rather than a `with` block inside each function, so that the
+    card is declared once next to the section's name instead of indenting
+    every body by four spaces and inviting one of them to be forgotten.
+    """
+
+    @functools.wraps(section)
+    def draw(*args, **kwargs):
+        with st.container(border=True):
+            return section(*args, **kwargs)
+
+    return draw
+
+
+def style(figure):
+    """Strip a Plotly figure back to the data.
+
+    The default template draws a filled plot area, a box around it and a grid
+    in both directions. On a page made of white cards that is three competing
+    rectangles per chart. Horizontal gridlines survive because reading a value
+    off a bar needs them; nothing else does.
+    """
+    figure.update_layout(
+        margin=dict(t=8, b=8, l=8, r=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        hoverlabel=dict(bgcolor="white", font_size=13),
+        showlegend=False,
+    )
+    figure.update_xaxes(showgrid=False, showline=False, zeroline=False)
+    figure.update_yaxes(
+        showgrid=True, gridcolor="#EDEFF2", showline=False, zeroline=False
+    )
+    return figure
 
 
 def money(value: float | None) -> str:
@@ -116,14 +155,19 @@ def headline(filters: dict) -> int:
     ).iloc[0]
 
     count = int(row["n_filings"])
-    left, middle, right, far = st.columns(4)
-    left.metric("Median offered wage", money(row["p50"]))
-    middle.metric("25th percentile", money(row["p25"]))
-    right.metric("75th percentile", money(row["p75"]))
-    far.metric("Filings", f"{count:,}")
+    cards = [
+        ("Median offered wage", money(row["p50"])),
+        ("25th percentile", money(row["p25"])),
+        ("75th percentile", money(row["p75"])),
+        ("Filings", f"{count:,}"),
+    ]
+    for column, (label, value) in zip(st.columns(4), cards):
+        with column.container(border=True):
+            st.metric(label, value)
     return count
 
 
+@_card
 def distribution_chart(filters: dict) -> None:
     st.subheader("Distribution")
     frame = distribution(
@@ -137,7 +181,8 @@ def distribution_chart(filters: dict) -> None:
         frame, x="bin_floor", y="n_filings",
         labels={"bin_floor": "Offered wage (USD/year)", "n_filings": "Filings"},
     )
-    figure.update_layout(bargap=0.05, margin=dict(t=10, b=10))
+    figure.update_layout(bargap=0.05)
+    style(figure)
 
     # Every bar is in the figure; only the initial view is narrowed. The top
     # 0.5% of Software Engineer filings reach $1.9M, which stretches the axis
@@ -164,6 +209,7 @@ def _visible_range(frame: pd.DataFrame, share: float = 0.995) -> tuple[int, int]
     return cap, int(frame.loc[frame["bin_floor"] > cap, "n_filings"].sum())
 
 
+@_card
 def employers_table(filters: dict) -> None:
     st.subheader("Employers filing most often")
     frame = employers(filters["job_title"], filters["city"], 20)
@@ -181,6 +227,7 @@ def employers_table(filters: dict) -> None:
     )
 
 
+@_card
 def cities_table(filters: dict) -> None:
     st.subheader("Where it pays most")
     frame = by_city(filters["job_title"], filters["min_filings"])
@@ -202,6 +249,7 @@ def cities_table(filters: dict) -> None:
     )
 
 
+@_card
 def trend_chart(filters: dict) -> None:
     st.subheader("By fiscal year")
     frame = trend(filters["job_title"], filters["city"])
@@ -213,7 +261,7 @@ def trend_chart(filters: dict) -> None:
         frame, x="fiscal_year", y="median_wage", markers=True,
         labels={"fiscal_year": "Fiscal year", "median_wage": "Median wage (USD/year)"},
     )
-    figure.update_layout(margin=dict(t=10, b=10))
+    style(figure)
     figure.update_xaxes(tickmode="array", tickvals=frame["fiscal_year"])
     st.plotly_chart(figure, width="stretch")
 

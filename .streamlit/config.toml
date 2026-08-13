@@ -1,0 +1,43 @@
+# Appearance for the deployed dashboard.
+#
+# Everything here is a documented Streamlit theme option rather than CSS
+# injected against Streamlit's internal class names. Those class names change
+# between releases without notice, and a portfolio site that renders correctly
+# today and silently breaks on a platform upgrade is worse than a plainer one
+# that keeps working.
+
+[theme]
+base = "light"
+
+# A near-white page with white cards on top of it. The separation between the
+# two is what makes bordered containers read as cards rather than as boxes.
+backgroundColor = "#F5F6F8"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0F1115"
+
+primaryColor = "#2F6BFF"
+linkColor = "#2F6BFF"
+borderColor = "#E5E7EB"
+
+baseRadius = "large"
+showWidgetBorder = true
+showSidebarBorder = true
+
+font = "sans-serif"
+headingFontWeights = [700, 700, 600]
+
+# Ordered so the first colour carries every single-series chart. Blue for the
+# distribution, teal for the trend; the rest only appear if a chart ever splits
+# into categories.
+chartCategoricalColors = [
+    "#2F6BFF",
+    "#0EA5A5",
+    "#F59E0B",
+    "#EC4899",
+    "#8B5CF6",
+    "#10B981",
+]
+
+[browser]
+# Nothing here needs to phone home for a read-only public dashboard.
+gatherUsageStats = false
