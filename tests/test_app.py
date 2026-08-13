@@ -141,6 +141,58 @@ def test_every_section_draws_when_there_is_data(app):
     assert len(test.get("plotly_chart")) == 2
 
 
+def test_the_histogram_is_not_stretched_by_a_handful_of_huge_wages(app, monkeypatch):
+    """One $9M filing among 26 must not squash the rest into a sliver.
+
+    Nothing is dropped — the bar is still in the figure — but the initial
+    view stops short of it and the page says how many are off screen.
+    """
+    import app as dashboard
+
+    frame = pd.DataFrame(
+        {"bin_floor": [90_000, 100_000, 110_000, 9_000_000],
+         "n_filings": [400, 400, 195, 5]}
+    )
+    cap, beyond = dashboard._visible_range(frame)
+    assert cap < 9_000_000
+    assert beyond == 5
+
+    # Driven directly with a long-tailed frame: the app fixture has 12 filings
+    # for the default title, and 0.5% of 12 rounds to nothing, so no tail can
+    # exist. On the real data this leaves 242 filings off screen.
+    app()
+    said: list[str] = []
+    drawn: list = []
+    monkeypatch.setattr(dashboard, "distribution", lambda *a, **k: frame)
+    monkeypatch.setattr(dashboard.st, "caption", lambda text: said.append(text))
+    monkeypatch.setattr(dashboard.st, "subheader", lambda text: None)
+    monkeypatch.setattr(
+        dashboard.st, "plotly_chart", lambda figure, **k: drawn.append(figure)
+    )
+
+    dashboard.distribution_chart(
+        {"job_title": None, "city": None, "state": None,
+         "fiscal_year": None, "include_outliers": False}
+    )
+    assert any("outside this view" in text for text in said), said
+
+    # The range has to reach the figure, not just be calculated correctly.
+    drawn_range = drawn[0].layout.xaxis.range
+    assert drawn_range is not None, "the axis range was never applied"
+    assert drawn_range[1] == cap
+    # Every bar is still there — only the initial view is narrowed.
+    assert 9_000_000 in list(drawn[0].data[0].x)
+
+
+def test_a_distribution_with_no_tail_hides_nothing(app):
+    import app as dashboard
+
+    frame = pd.DataFrame({"bin_floor": [90_000, 100_000], "n_filings": [50, 50]})
+    cap, beyond = dashboard._visible_range(frame)
+    assert beyond == 0
+    assert cap >= 100_000
+
+
 def test_the_year_picker_offers_every_year_in_the_data(tmp_path, monkeypatch):
     """Not just the years the default job title happens to have filings in."""
     frame = cleaned(

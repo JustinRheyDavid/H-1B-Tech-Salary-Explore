@@ -1,30 +1,28 @@
 # H-1B Tech Salary Explorer
 
-What tech jobs in the US actually pay, based on ~1.8M salary figures that
-employers filed with the Department of Labor.
+What US tech jobs actually pay, from 850,321 wage figures employers filed with
+the Department of Labor — searchable by job title, city and year.
 
-**Live demo:** _not deployed yet — see Step 9 of the build plan._
-
-Run it locally with `streamlit run app.py` once `data/h1b.db` is built.
+### ▶ [Open the live dashboard](https://h-1b-tech-salary-explore-morzlyjgltmfnutdx7pa68.streamlit.app/)
 
 ---
 
 ## Why this data
 
-Most salary sites report what people say they earn. This reports what
-employers legally committed to pay, on federal forms, under penalty of
-perjury. Every figure here comes from a Labor Condition Application (LCA)
-filed with the DOL Office of Foreign Labor Certification.
+Most salary sites report what people say they earn. This reports what employers
+legally committed to pay, on federal forms, under penalty of perjury. Every
+figure comes from a Labor Condition Application filed with the DOL Office of
+Foreign Labor Certification before hiring on an H-1B, E-3 or H-1B1 visa.
 
-It is public data, exact rather than banded, and genuinely messy — mixed
-pay units, inconsistent employer names, and column headers that change
-between fiscal years. Cleaning it is most of the work.
+It is public, exact rather than banded, and genuinely messy — mixed pay units,
+inconsistent employer names, column headers that change between fiscal years,
+and 73% of the rows blank. Cleaning it is most of the work, and the
+[cleaning decisions](#data-cleaning-decisions) below are the part worth reading.
 
 ## Status
 
-Build in progress. Steps 1-8 of 10 complete — see
-[`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md)
-for the full plan.
+Complete and deployed. Built in ten steps against
+[`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md).
 
 - [x] 1. Repo skeleton and dependencies
 - [x] 2. Data acquisition
@@ -34,130 +32,136 @@ for the full plan.
 - [x] 6. Database schema and loader
 - [x] 7. Query layer
 - [x] 8. Streamlit dashboard
-- [ ] 9. Deploy
-- [ ] 10. Documentation
+- [x] 9. Deploy
+- [x] 10. Documentation
 
 ## Data sources
 
 Nine quarterly files from the [DOL OFLC performance data page](https://www.dol.gov/agencies/eta/foreign-labor/performance),
-under **Disclosure Data → LCA Programs (H-1B, H-1B1, E-3)**. Downloaded 2026-08-06.
+under **Disclosure Data → LCA Programs (H-1B, H-1B1, E-3)**, downloaded
+6 August 2026. Together they cover **October 2023 to March 2026** — ten
+consecutive quarters, no gaps.
 
-Together they cover **October 2023 through March 2026** — ten consecutive
-quarters, no gaps. Periods below are `DECISION_DATE` ranges read from the
-files themselves rather than inferred from the filenames.
+| Stage | Rows |
+|---|---:|
+| Rows in the nine spreadsheets | 4,978,487 |
+| Blank padding rows, dropped on read | −3,610,511 |
+| Duplicate case numbers, deduplicated | −20,873 |
+| Not certified (denied or withdrawn) | −31,304 |
+| Not a tech occupation | −465,478 |
+| **Filings in the database** | **850,321** |
 
-| File | Period | Sheet rows | Blank | Real rows | Cols |
-|---|---|---:|---:|---:|---:|
-| `LCA_Disclosure_Data_FY2024_Q1.xlsx` | Oct–Dec 2023 | 99,692 | 0 | 99,692 | 97 |
-| `LCA_Disclosure_Data_FY2024_Q2.xlsx` | Jan–Mar 2024 | 123,978 | 0 | 123,978 | 97 |
-| `LCA_Disclosure_Data_FY2024_Q3.xlsx` | Apr–Jun 2024 | 694,404 | 477,934 | 216,470 | 97 |
-| `LCA_Disclosure_Data_FY2024_Q4.xlsx` | Jul–Sep 2024 | 598,831 | 477,934 | 120,897 | 97 |
-| `LCA_Disclosure_Data_FY2025_Q1.xlsx` | Oct–Dec 2024 | 1,042,871 | 935,457 | 107,414 | 97 |
-| `LCA_Disclosure_Data_FY2025_Q2.xlsx` | Jan–Mar 2025 | 132,133 | 0 | 132,133 | 98 |
-| `LCA_Disclosure_Data_FY2025_Q3.xlsx` | Apr–Jun 2025 | 683,534 | 445,109 | 238,425 | 98 |
-| `LCA_Disclosure_Data_FY2025_Q4.xlsx` | Jul–Sep 2025 | 563,689 | 445,109 | 118,580 | 98 |
-| `LCA_Dislclosure_Data_FY2026_Q2.xlsx` | Oct 2025–Mar 2026 | 1,039,355 | 828,968 | 210,387 | 98 |
-| **Total** | | **4,978,487** | **3,610,511** | **1,367,976** | |
+Per-file row counts and the record layouts are in
+[`docs/data-sources.md`](docs/data-sources.md).
 
-After deduplicating on `CASE_NUMBER`: **1,347,103 unique filings.**
+## Data cleaning decisions
 
-Record layouts (`LCA_Record_Layout_FY2025_Q4.pdf`, `LCA_Record_Layout_FY2026_Q2.pdf`)
-are the official column dictionaries and are kept alongside the data.
+Seventeen defects were measured in
+[`notebooks/01_exploration.ipynb`](notebooks/01_exploration.ipynb) before any
+cleaning code was written. These are the decisions that change the numbers.
 
-### Known quirks in the source files
+**Wages are annualized, and 3,221 filings had the wrong unit.** Filings state
+an amount and a unit — Year, Month, Bi-Weekly, Week or Hour. Some state an
+annual salary against an hourly unit. A figure that is implausible once scaled
+by its unit but plausible taken as-is is treated as already annual. Left alone,
+the maximum wage is $1.47 billion and the mean is $428,938 against a median of
+$118,248. The decision is made once per filing from the low end of the band, so
+a band can never end up with its two sides on different scales.
 
-Found by inspecting all nine files before writing any cleaning code. Each
-one breaks an assumption a reasonable person would make:
+**A third of filings give a range, not a figure — this reports the midpoint.**
+`WAGE_RATE_OF_PAY_TO` is populated on 32% of rows with a median spread of 22%.
+Reading only the lower bound understates those salaries by 13.8%. Both ends are
+kept in the database. The metric is labelled *offered wage* rather than
+*salary*, because that is what it is.
 
-1. **73% of all rows are blank padding.** 3,610,511 of 4,978,487 rows are
-   entirely empty. The padding is wildly inconsistent — four files have none
-   at all, while `FY2025_Q1` has 935,457 blank rows against 107,414 real
-   ones. `pd.read_excel(...).shape` reports the padded count, so any row
-   count or average computed before dropping blanks is wrong.
-2. **Every file has a different sheet name** — `Q1`…`Q4`,
-   `LCA_Disclosure_Data_FY2025_Q1`…`_Q4`, and `Sheet1`. Nine files, nine
-   names. Select the sheet by index, never by name.
-3. **The column set changes mid-fiscal-year.** FY2024 (all quarters) and
-   `FY2025_Q1` have 97 columns; `FY2025_Q2` onward have 98, the addition
-   being `LAWFIRM_BUSINESS_FEIN`. The change lands between Q1 and Q2 of
-   FY2025, *not* at a fiscal year boundary — so keying the schema off the
-   year in the filename would be wrong.
-4. **DOL misspelled one filename** — `LCA_Dislclosure_Data_FY2026_Q2.xlsx`
-   ("Dislclosure"). Match files by glob, not by literal name.
-5. **20,873 case numbers appear in two files each.** Every duplicate spans
-   a quarter boundary and none are repeated within a single file — a case
-   decided near the cutoff gets published in both quarters. Deduplicate on
-   `CASE_NUMBER`.
-6. **FY2026_Q2 is cumulative; the rest are not.** It covers two quarters
-   (Oct 2025–Mar 2026) while every other file covers one. Naming alone does
-   not tell you this.
-7. **A third of filings give a wage *band*, not a figure.**
-   `WAGE_RATE_OF_PAY_TO` is populated on 32% of rows, with a median spread of
-   22%. Reading `WAGE_RATE_OF_PAY_FROM` alone understates those salaries by
-   13.8%. This project reports the midpoint and keeps both columns.
-8. **3,221 filings use the wrong wage unit.** Annual salaries were filed
-   against `Hour`, `Week`, `Bi-Weekly`, and `Month`. Left uncorrected the
-   maximum annualized wage is $1.47 billion and the mean is $428,938 against a
-   median of $118,248. After repair the mean is $130,848.
-9. **Not every row is H-1B.** `VISA_CLASS` also contains E-3 Australian,
-   H-1B1 Chile, and H-1B1 Singapore — roughly 3% of rows. All of them are
-   loaded: they are filed on the same form under the same wage rules, and the
-   `visa_class` column lets you exclude them if you disagree.
-10. **`PREVAILING_WAGE` has the same unit defect, and it is worse.** Nine
-    certified filings carry an annual figure labelled `Week` or `Hour`, putting
-    the maximum prevailing wage at $360,056,320. Four of them pair it with a
-    perfectly ordinary offered wage, so any outlier check based on the offered
-    wage alone passes them through. The two columns are repaired and flagged
-    independently for that reason. Five filings survive repair with a figure
-    implausible under every unit — wrong at source, flagged rather than fixed.
-11. **2,216 filings have no `DECISION_DATE`.** All of them have a
-    `RECEIVED_DATE`, which this project falls back to so the row keeps a fiscal
-    year instead of dropping out of every trend chart. For those 0.16% of rows
-    the year is when the filing was received, not when it was decided. Three
-    were received in FY2023, a year these files do not otherwise cover, so the
-    fallback is floored at FY2024 — a case published in this data was decided
-    no earlier than that, and three rows are not a trend line. That floor is
-    `clean.EARLIEST_FISCAL_YEAR`; **change it if you swap the source files for
-    a different range of years.**
-12. **The database has to fit in 100 MB.** GitHub refuses any file above that,
-    and `data/h1b.db` is committed so the deployed dashboard needs no
-    credentials. The planned three-table schema, with `job_title` stored inline
-    and wages as `REAL`, measured 148 MB — unpushable. Lookup tables for job
-    title, employer, occupation, location and visa class; integer wages; the
-    case-number serial used as the rowid; and indexes only on the two columns
-    queries filter on bring it to 78 MB. No rows were dropped to get there —
-    all 850,321 filings are loaded, and the `v_filings` view joins it back
-    together with the case number reassembled.
+**Only certified filings count.** Denied and withdrawn cases are 7.5% of rows
+and never became an offer. `Certified` and `Certified - Withdrawn` are kept —
+the second means the employer certified and later withdrew, so the wage was
+still committed to.
+
+**Outliers are flagged, never deleted.** 37 tech filings annualize below
+$10,000 or above $2,000,000. They stay in the database with `is_outlier = 1`
+and are excluded from every figure by default, with a toggle to include them.
+The flag is set on the *reported midpoint*, not the lower bound — flagging the
+lower bound misses 84 filings whose floor is plausible but whose midpoint is
+not.
+
+**The prevailing wage is repaired and flagged separately.** It carries the same
+unit defect, and worse: nine filings put it at up to $360,056,320. Four of them
+pair that with a perfectly ordinary offered wage, so an outlier check based on
+the offered wage alone lets them through. Two columns, two flags.
+
+**Employer normalization is deliberately conservative** — case, punctuation and
+one trailing legal suffix, nothing else. `MICROSOFT CORPORATION` and
+`Microsoft Corp.` become one employer. No fuzzy matching: `SparkCognizant Inc`
+and `TMG HEALTH - A COGNIZANT COMPANY` are unrelated to Cognizant Technology
+Solutions, and a similarity threshold that merges the first two also merges the
+second two.
+
+**Job titles stay exactly as filed, and are matched case-insensitively.**
+Normalizing them would destroy what people search on; 3,587 filings say
+`Data Analyst` and 777 say `DATA ANALYST`, so an exact match loses 17% of them.
+`soc_title` provides the clean grouping instead.
+
+**Order matters.** Repair units → annualize → take the midpoint → flag
+outliers. Any other order lets bad data through a later gate.
+
+## Architecture
+
+```
+  DOL .xlsx files  ──▶  ingest  ──▶  clean  ──▶  load  ──▶  h1b.db  ──▶  Streamlit app
+   (data/raw/)                                            (SQLite)      (deployed)
+```
+
+One direction only. `clean.py` holds every normalization decision and touches
+neither the database nor the network; `queries.py` holds every SQL statement
+the dashboard runs; `app.py` contains no SQL at all.
+
+The database is six tables — filings plus lookups for employer, occupation,
+title, location and visa class — and is committed to the repo, so the deployed
+app needs no credentials and no cold-start setup. That constraint shaped the
+schema: the planned three-table version measured 148 MB, above GitHub's 100 MB
+file limit. Lookup tables, integer wages and indexes only on the two columns
+queries filter on bring it to 78 MB with all 850,321 filings intact.
+
+230 tests cover the cleaning rules, the loader, the SQL and the dashboard
+itself, which is exercised headlessly through Streamlit's `AppTest`.
 
 ## Running locally
 
 ```bash
 git clone https://github.com/JustinRheyDavid/H-1B-Tech-Salary-Explore.git
-cd H-1B-Tech-Salary-Explore
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+cd H-1B-Tech-Salary-Explore && pip install -r requirements.txt
+streamlit run app.py
 ```
 
-Requires Python 3.11 or newer.
+The database is in the repo, so that is all you need. Requires Python 3.11+.
+Rebuilding it from source spreadsheets — `python -m src.load` — needs the nine
+files in `data/raw/`; see [`docs/data-sources.md`](docs/data-sources.md).
 
-## Layout
+## Limitations
 
-```
-├── app.py             # Streamlit entry point            (Step 8)
-├── conftest.py        # puts the repo root on sys.path   (Step 5)
-├── src/
-│   ├── ingest.py      # read raw DOL files               (Step 4)
-│   ├── clean.py       # all normalization decisions      (Step 4)
-│   ├── load.py        # schema + database build          (Step 6)
-│   └── queries.py     # every SQL query the app runs     (Step 7)
-├── notebooks/         # exploratory analysis             (Step 3)
-├── tests/             # cleaning logic tests             (Step 5)
-└── data/
-    ├── raw/           # downloaded .xlsx (gitignored)
-    └── h1b.db         # built SQLite database (committed)
-```
+Worth knowing before quoting any of these numbers.
+
+- **This is not a salary survey.** It covers only roles an employer sought to
+  fill with sponsored workers. Employers large enough to run an immigration
+  process are over-represented, and everyone not sponsored is absent.
+- **Offered wage is not total compensation.** No equity, no bonus, no
+  relocation. In tech that gap is large and varies most at the companies paying
+  the most, so the top of the distribution is understated by more than the
+  bottom.
+- **A filing is not a hire.** It is a commitment made during an application.
+  Some roles were never filled, and some were filled at a different figure.
+- **Employer normalization is a heuristic.** Subsidiaries, acquisitions and
+  staffing firms filing on a client's behalf are not resolved, so a large
+  employer's filings may be split across several names.
+- **FY2026 covers two quarters** where every other year covers four. Its filing
+  count is not comparable with the others; its median is.
+- **2,216 filings have no decision date** and fall back to their received date
+  for the fiscal-year bucket — 0.16% of rows, dated by when they were filed
+  rather than decided.
 
 ## License
 
-Source data is US federal government work and in the public domain.
-Code in this repository is MIT licensed.
+Code under the MIT License. The underlying data is a public work of the US
+federal government and is not subject to copyright.

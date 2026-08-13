@@ -138,7 +138,30 @@ def distribution_chart(filters: dict) -> None:
         labels={"bin_floor": "Offered wage (USD/year)", "n_filings": "Filings"},
     )
     figure.update_layout(bargap=0.05, margin=dict(t=10, b=10))
+
+    # Every bar is in the figure; only the initial view is narrowed. The top
+    # 0.5% of Software Engineer filings reach $1.9M, which stretches the axis
+    # fivefold and squashes the 60k-300k range everyone came to look at into a
+    # sliver. Zooming out in the chart still shows the tail.
+    cap, beyond = _visible_range(frame)
+    figure.update_xaxes(range=[0, cap])
     st.plotly_chart(figure, width="stretch")
+    if beyond:
+        st.caption(
+            f"{beyond:,} filings above ${cap:,.0f} are outside this view — "
+            "double-click the chart to see the full range."
+        )
+
+
+def _visible_range(frame: pd.DataFrame, share: float = 0.995) -> tuple[int, int]:
+    """Where to cut the x-axis, and how many filings that leaves off screen."""
+    counts = frame["n_filings"]
+    reached = counts.cumsum() / counts.sum()
+    inside = frame.loc[reached >= share, "bin_floor"]
+    if inside.empty:
+        return int(frame["bin_floor"].max()), 0
+    cap = int(inside.iloc[0])
+    return cap, int(frame.loc[frame["bin_floor"] > cap, "n_filings"].sum())
 
 
 def employers_table(filters: dict) -> None:
