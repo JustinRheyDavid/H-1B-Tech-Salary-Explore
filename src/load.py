@@ -36,8 +36,6 @@ from uuid import uuid4
 
 import pandas as pd
 
-from src import clean, ingest
-
 __all__ = [
     "SCHEMA",
     "build",
@@ -320,6 +318,12 @@ def build(
     rather than an error, and two concurrent builds leave a file with no
     ``filings`` table at all.
     """
+    # Imported here rather than at the top because only this function needs
+    # them, and they cost the dashboard 8 MB and 75 ms of start-up for code it
+    # never runs: `ingest` pulls in openpyxl and pyarrow to read spreadsheets
+    # and Parquet, neither of which has anything to do with reading SQLite.
+    from src import clean, ingest
+
     if frame is None:
         raw = ingest.load_all(RAW_DIR, INTERIM_DIR, clean.SOURCE_COLUMNS)
         cleaned = clean.clean(raw)
