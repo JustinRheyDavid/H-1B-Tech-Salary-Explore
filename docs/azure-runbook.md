@@ -285,6 +285,10 @@ positive percentage of any positive budget amount, so **no threshold can ever be
 crossed while the design is working correctly.** Lowering the budget does not
 help: 50% of $0.01 is $0.005, and $0.00 still does not exceed it.
 
+Confirmed empirically 2026-08-14: after Step 3 deployed a real storage account,
+`currentSpend` still read `0.0`. An empty storage account costs nothing, so
+deploying infrastructure does not produce testable spend either.
+
 **Step 2's acceptance criterion as written is unachievable for this project.**
 The only condition that would satisfy it is the project failing at its goal.
 
@@ -397,7 +401,63 @@ In likelihood order, per plan §7:
 
 ## 4. Redeploy
 
-<!-- Step 12. Not written yet — needs Phases B through E to exist first. -->
+### Infrastructure
+
+All Azure resources are declared in `infra/`. Deployment is declarative and
+idempotent — running it against unchanged state is a no-op, verified below.
+
+Preview first. This shows what would change without changing anything:
+
+```bash
+az deployment group what-if -g rg-h1b --template-file infra/main.bicep --parameters infra/main.parameters.json --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+Then apply:
+
+```bash
+az deployment group create -g rg-h1b --template-file infra/main.bicep --parameters infra/main.parameters.json --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+`--subscription` is passed explicitly on purpose — see §1's warning about two
+subscriptions sharing a name.
+
+> **A clean `what-if` must read `N no change`.** If it reports modifications on
+> an unchanged template, the template is under-declaring properties that Azure
+> populates by default, not detecting real drift. Both container resources and
+> `blobServices/default` needed `defaultEncryptionScope`,
+> `denyEncryptionScopeOverride`, and `deleteRetentionPolicy` declared for this
+> reason. Fix the template rather than learning to ignore the diff — Step 11
+> runs these deploys in CI, where a permanently dirty diff hides real changes.
+
+### Step 3 — storage, DONE 2026-08-14
+
+```
+STORAGE_ACCOUNT = sth1bcpwrzc33jcfjw
+BLOB_ENDPOINT   = https://sth1bcpwrzc33jcfjw.blob.core.windows.net/
+CONTAINERS      = raw, curated
+LIFECYCLE       = delete blobs under raw/ after 90 days
+```
+
+The account name is `st` + prefix + `uniqueString(resourceGroup().id)`. Storage
+account names are globally unique, 3–24 characters, **lowercase alphanumeric
+only** — which is why the `h1b-` hyphen used for `h1b-web` and `h1b-etl` cannot
+appear here. `uniqueString` is deterministic per resource group, so a redeploy
+reuses the same account instead of orphaning the old one.
+
+`allowSharedKeyAccess` is `false`, so every data-plane command needs
+`--auth-mode login`:
+
+```bash
+az storage container list --account-name sth1bcpwrzc33jcfjw --auth-mode login --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 -o table
+```
+
+- [x] Both containers exist
+- [x] Redeploy is idempotent — `what-if` reports `5 no change`
+- [x] Spend after deployment still `$0.00`
+
+### Data
+
+<!-- Step 7 onward. Not written yet. -->
 
 `<TO BE WRITTEN>`
 
