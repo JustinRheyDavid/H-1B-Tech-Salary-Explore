@@ -95,10 +95,24 @@ module sql 'sql.bicep' = {
   }
 }
 
+module containerapps 'containerapps.bicep' = {
+  name: 'containerapps'
+  params: {
+    location: location
+    namePrefix: namePrefix
+  }
+}
+
 output storageAccountName string = storage.outputs.storageAccountName
 output blobEndpoint string = storage.outputs.blobEndpoint
 output sqlServerFqdn string = sql.outputs.sqlServerFqdn
 output databaseName string = sql.outputs.databaseName
+output webAppFqdn string = containerapps.outputs.webAppFqdn
+output etlJobName string = containerapps.outputs.etlJobName
+
+// Step 6 needs these to create the SQL users and assign the storage role.
+output webPrincipalId string = containerapps.outputs.webPrincipalId
+output etlPrincipalId string = containerapps.outputs.etlPrincipalId
 
 // infra/budget.json hardcodes this ID in its contactGroups. If the Action Group
 // is ever renamed or moved, that file must be updated and the budget re-applied.

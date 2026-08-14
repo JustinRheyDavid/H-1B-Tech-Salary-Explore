@@ -3,7 +3,7 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–4 done. Every value below was read from a live `az` command
+**Status:** Steps 1–5 done. Every value below was read from a live `az` command
 or a real SQL connection rather than transcribed. The data path (Step 7 onward)
 and teardown are still `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real
 blank, not a placeholder for something already known.
@@ -583,6 +583,82 @@ syntax error in the SQL rather than a database setting.
 - [x] Entra-only authentication confirmed `true`
 - [x] Connected over Entra auth with no password
 - [x] Compatibility level 170 ≥ 160
+- [x] Spend after deployment still `$0.00`
+
+### Step 5 — Container Apps, DONE 2026-08-14
+
+```
+ENVIRONMENT = h1b-env            (Consumption-only, no VNet)
+WEB APP     = h1b-web            https://h1b-web.calmwave-8f560d92.canadacentral.azurecontainerapps.io
+ETL JOB     = h1b-etl            Manual trigger, replicaTimeout 3600
+IMAGE       = mcr.microsoft.com/k8se/quickstart:latest  (placeholder; Step 9 replaces)
+```
+
+Managed identity principal IDs — **Step 6 needs both**:
+
+```
+h1b-web  b16f09c9-0791-487c-8801-baa35d3435bd   (SystemAssigned, gets db_datareader)
+h1b-etl  7cb7a8f0-0417-402c-8971-ee3ca66137a2   (SystemAssigned, gets db_datawriter + blob contributor)
+```
+
+> These change if the app or job is deleted and recreated. Re-read them with
+> `az containerapp show -n h1b-web -g rg-h1b --query identity.principalId -o tsv`
+> before running Step 6's grants.
+
+#### `minReplicas: 0` is the whole cost story
+
+Verified on the deployed app: `minReplicas 0`, `maxReplicas 1`, 0.5 CPU / 1 Gi.
+Idle charges begin the moment minimum replicas exceeds zero, so this is the
+single most expensive value in `infra/containerapps.bicep`. Plan §7 lists raising
+it as the second most likely way this project starts costing money.
+
+The consequence is a cold start on the first request after idle — expected, not a
+bug. Plan §8 puts it at 20–30 seconds and recommends saying so next to the link.
+
+#### The environment has no log destination
+
+Deliberate. A Log Analytics workspace is billable past 5 GB of ingestion and
+appears nowhere in §7's cost model, so attaching one would breach B3. Live
+streaming still works and needs no workspace:
+
+```bash
+az containerapp logs show -n h1b-web -g rg-h1b --follow --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+What is lost is queryable history — you cannot ask why a container died an hour
+ago. If Step 9's ODBC install proves hard to debug (plan §8 rates that risk
+medium-high), adding a workspace is a small reversible change.
+
+#### Deviation: targetPort is a parameter, defaulting to 80
+
+Step 5 specifies `targetPort: 8501` **and** the quickstart placeholder image.
+Those contradict each other — the quickstart image serves on port 80, so with
+8501 nothing accepts a connection, the revision sits in `Activating`
+indefinitely, and requests to the FQDN hang with no response. Observed exactly
+that on the first deploy; the ARM deployment still reported `Succeeded`.
+
+The port is a property of the image, so it now travels with the image. Step 9
+sets both together:
+
+```bash
+--parameters containerImage=ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest targetPort=8501
+```
+
+#### `what-if` does not reach zero changes here, and cannot
+
+It reports `12 no change, 1 to modify`. The single modification is
+`properties.runningStatus: "Running"` on `h1b-web`, which is **server-computed
+and not declarable** — confirmed by Bicep rejecting it with
+`BCP037: The property "runningStatus" is not allowed`. Unlike Steps 3 and 4,
+where every phantom diff was fixable by declaring server defaults, this one is
+irreducible. Treat `1 to modify` naming only `runningStatus` as the clean
+baseline for this resource, and investigate anything else.
+
+- [x] Environment provisioned, Consumption-only, no VNet
+- [x] Web app returns **HTTP 200 over HTTPS** at its FQDN — 4,331 bytes of HTML
+- [x] `az containerapp job list` shows `h1b-etl`, Manual, timeout 3600
+- [x] `minReplicas: 0` confirmed on the deployed app
+- [x] Both managed identities exist with principal IDs recorded above
 - [x] Spend after deployment still `$0.00`
 
 ### Data
