@@ -3,10 +3,10 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Phase A complete — Steps 1 and 2 are done, and every value below was
-read from a live `az` command rather than transcribed. Sections 4 and 6 are
-still `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real blank, not a
-placeholder for something already known.
+**Status:** Steps 1–4 done. Every value below was read from a live `az` command
+or a real SQL connection rather than transcribed. The data path (Step 7 onward)
+and teardown are still `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real
+blank, not a placeholder for something already known.
 
 The build plan this follows is [`docs/plans/azure-migration.md`](plans/azure-migration.md).
 
@@ -18,15 +18,46 @@ Both get baked into a federated credential (Step 11) and a manual T-SQL grant
 (Step 6), where changing them is annoying. Decided 2026-08-14, before any
 resource existed.
 
-### 0.1 Region — `eastus`
+### 0.1 Region — `canadacentral` (revised 2026-08-14)
 
 ```
-REGION = eastus
+REGION = canadacentral
 ```
 
-Per plan §9.2: widest service availability and the lowest chance of a free-tier
-capacity error, which is a real failure mode for the Azure SQL free offer.
-Allowed by assumption B5.
+Originally `eastus`, per plan §9.2's reasoning about widest service availability.
+**That turned out to be wrong for this subscription.** Azure SQL returns
+`ProvisioningDisabled` in both `eastus` and `eastus2` here — provisioning is
+restricted, and the only remedies Azure offers are a different region or a
+support request.
+
+Check this **before** picking a region, not after a failed deployment:
+
+```bash
+az sql db list-editions -l <region> --edition GeneralPurpose --available --query "[].supportedServiceLevelObjectives[?name=='GP_S_Gen5_2']"
+```
+
+`--available` is the whole point. Without it the command lists Azure's global
+catalog, which happily includes SKUs this subscription cannot provision. Probed
+2026-08-14:
+
+| Region | In catalog | Available to this subscription |
+|---|---|---|
+| `eastus` | yes | **no** |
+| `eastus2` | yes | **no** |
+| `canadacentral` | yes | yes |
+| `westus2` | yes | yes |
+| `centralus` | yes | yes |
+
+`canadacentral` chosen from the available set — it is the closest to Montreal,
+so lowest latency for local use and for Canadian reviewers. Container Apps and
+Storage were confirmed available there too before committing.
+
+> **`rg-h1b` itself still reports `eastus`.** A resource group's location only
+> determines where its *metadata* is stored; it does not constrain or affect
+> where resources run, what they cost, or their latency. Every actual resource
+> is in `canadacentral`. This is why `main.bicep` takes `location` as a required
+> parameter instead of defaulting to `resourceGroup().location` — inheriting it
+> would silently put everything back in the region that does not work.
 
 ### 0.2 Resource naming — `h1b-*`
 
@@ -175,7 +206,7 @@ az group show -n rg-h1b --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
 ```
 
 - [x] `az account show` returns the subscription
-- [x] `az group show` returns the group — `rg-h1b`, `eastus`, `Succeeded`
+- [x] `az group show` returns the group — `rg-h1b`, `Succeeded` (metadata in `eastus`; resources are in `canadacentral`, see §0.1)
 - [x] Subscription ID and tenant ID recorded above
 - [x] Pre-flight check passed — `allowedToCreateApps: true`, so Step 11 is viable
 - [x] Offer type checked — Pay-As-You-Go, **no spending limit**, see §2.1
@@ -432,8 +463,8 @@ subscriptions sharing a name.
 ### Step 3 — storage, DONE 2026-08-14
 
 ```
-STORAGE_ACCOUNT = sth1bcpwrzc33jcfjw
-BLOB_ENDPOINT   = https://sth1bcpwrzc33jcfjw.blob.core.windows.net/
+STORAGE_ACCOUNT = sth1bhutymqa65yoty
+BLOB_ENDPOINT   = https://sth1bhutymqa65yoty.blob.core.windows.net/
 CONTAINERS      = raw, curated
 LIFECYCLE       = delete blobs under raw/ after 90 days
 ```
@@ -448,11 +479,83 @@ reuses the same account instead of orphaning the old one.
 `--auth-mode login`:
 
 ```bash
-az storage container list --account-name sth1bcpwrzc33jcfjw --auth-mode login --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 -o table
+az storage container list --account-name sth1bhutymqa65yoty --auth-mode login --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 -o table
 ```
 
 - [x] Both containers exist
 - [x] Redeploy is idempotent — `what-if` reports `5 no change`
+- [x] Spend after deployment still `$0.00`
+
+### Step 4 — Azure SQL on the free offer, DONE 2026-08-14
+
+```
+SQL_SERVER   = sql-h1b-hutymqa65yoty.database.windows.net
+DATABASE     = sqldb-h1b
+SKU          = GP_S_Gen5_2 (General Purpose, serverless, 2 vCore max)
+LOCATION     = canadacentral
+```
+
+Verified with `az sql db show` — every one of these is a value where the wrong
+setting costs money:
+
+| Property | Value | Why it matters |
+|---|---|---|
+| `useFreeLimit` | `true` | opts into the free vCore/storage grant |
+| `freeLimitExhaustionBehavior` | `AutoPause` | pauses when the grant runs out. `BillOverUsage` would charge instead |
+| `autoPauseDelay` | `60` | minutes idle before pausing |
+| `minCapacity` | `0.5` | smallest serverless floor |
+| `maxSizeBytes` | `34359738368` | 32 GiB, the free storage allowance |
+| `currentBackupStorageRedundancy` | `Local` | geo-redundant backup is billable |
+| `azureAdOnlyAuthentication` | `true` | SQL password auth is impossible, not merely discouraged |
+
+#### Connecting
+
+`sqlcmd` (go-sqlcmd, `brew install sqlcmd`) reuses the existing `az login`
+session, so no password is involved anywhere:
+
+```bash
+sqlcmd -S sql-h1b-hutymqa65yoty.database.windows.net -d sqldb-h1b --authentication-method ActiveDirectoryAzCli -Q "SELECT DB_NAME();"
+```
+
+#### Firewall — and why your IP is not in this repo
+
+Two rules exist. `AllowAllWindowsAzureIps` (0.0.0.0) is in the template.
+`ClientDevelopmentMachine` is **not** — `clientIpAddress` defaults to empty and
+the rule is conditional, because a home IP address does not belong in a public
+repository. Pass it at deploy time:
+
+```bash
+az deployment group create -g rg-h1b --template-file infra/main.bicep --parameters infra/main.parameters.json --parameters clientIpAddress=<your-ip> --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+To find your IP without handing it to a third-party lookup service, just attempt
+the connection — Azure's rejection names the blocked address:
+
+```
+Client with IP address 'x.x.x.x' is not allowed to access the server.
+```
+
+Re-run the deploy with that value. Changes take up to five minutes to apply.
+A changed home IP is the usual cause of a connection that worked yesterday.
+
+#### Compatibility level
+
+The one Step 4 check ARM cannot answer — compatibility level is not exposed on
+the database resource, only through a real SQL connection:
+
+```bash
+sqlcmd -S sql-h1b-hutymqa65yoty.database.windows.net -d sqldb-h1b --authentication-method ActiveDirectoryAzCli -Q "SET NOCOUNT ON; SELECT name, compatibility_level FROM sys.databases WHERE name = DB_NAME();"
+```
+
+Returned **170**, comfortably above the 160 floor. Below 160, `salary_trend`'s
+`WINDOW` clause is rejected outright and the failure at Step 8 reads like a
+syntax error in the SQL rather than a database setting.
+
+- [x] Database exists and reports `Online`
+- [x] `useFreeLimit: true` and `freeLimitExhaustionBehavior: AutoPause`
+- [x] Entra-only authentication confirmed `true`
+- [x] Connected over Entra auth with no password
+- [x] Compatibility level 170 ≥ 160
 - [x] Spend after deployment still `$0.00`
 
 ### Data

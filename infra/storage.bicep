@@ -20,10 +20,15 @@ param namePrefix string
 param rawRetentionDays int
 
 // Storage account names are globally unique across all of Azure, 3-24 chars,
-// lowercase alphanumeric only. uniqueString() is deterministic per resource
-// group, so redeploying yields the same name rather than orphaning the old one.
+// lowercase alphanumeric only. uniqueString() is deterministic, so redeploying
+// yields the same name rather than orphaning the old one.
 // 'st' (2) + prefix (<=8) + uniqueString (13) stays inside 24.
-var storageAccountName = 'st${namePrefix}${uniqueString(resourceGroup().id)}'
+//
+// Seeded with `location` as well as the resource group, for the same reason as
+// the SQL server name in main.bicep: these are global DNS names, and a name
+// used in one region is not immediately reusable in another. Including the
+// region means a region change produces a fresh name instead of a collision.
+var storageAccountName = 'st${namePrefix}${uniqueString(resourceGroup().id, location)}'
 
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
