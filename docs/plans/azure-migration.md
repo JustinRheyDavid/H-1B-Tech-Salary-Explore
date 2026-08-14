@@ -67,7 +67,7 @@ story, not a syntax exercise.
 | B2 | New Azure account, created with a credit card, no free credits consumed yet | Stated by user. **Still to do — Steps 1–2** |
 | B3 | Hard $0 budget — no step may create a billable resource | Stated by user |
 | B4 | Repo is `github.com/JustinRheyDavid/H-1B-Tech-Salary-Explore`, public | **Corrected** — this plan said `prevailing`, a name never used. It matters: the repo slug is the OIDC federated-credential subject in Step 11 and the GHCR image path in Step 9, and neither error message names the string it rejected |
-| B5 | Region is a single region, `eastus` or `westus2` | Multi-region is meaningless here and doubles cost risk |
+| B5 | Region is a single region. **Corrected — `canadacentral`, not the `eastus` or `westus2` originally listed.** Azure SQL returns `ProvisioningDisabled` in `eastus` and `eastus2` on this subscription; see §9.2 | Multi-region is meaningless here and doubles cost risk. Splitting regions would also add billable cross-region egress to a $0.00 design |
 | B6 | The Streamlit Cloud deploy stays live during and after migration | Free insurance — if Azure breaks, the demo link still works |
 | B7 | Data refresh stays manual (trigger the job by hand) | Scheduled refresh is Step 12's optional extra, not core |
 | B8 | Container images are hosted on GitHub Container Registry, not Azure Container Registry | **ACR has no free tier — Basic is ~$5/month.** This is the single most common way this project would start costing money |
@@ -203,7 +203,7 @@ Twelve steps in five phases. **Do not start Phase B until Step 2's budget alert 
 ### Step 1 — Create the Azure account
 **Files:** `docs/azure-runbook.md` (new, stub)
 
-Create a free Azure account. Record the subscription ID and tenant ID in the runbook. Create resource group `rg-h1b` in `eastus` (both settled per §9.2 and §9.6).
+Create a free Azure account. Record the subscription ID and tenant ID in the runbook. Create resource group `rg-h1b` (name settled per §9.6). Resources go in `canadacentral` per §9.2 — note the resource group's own location is metadata only and does not constrain where resources run.
 
 Note honestly in the runbook: a credit card is required at signup, and the account starts with trial credit that expires. Nothing in this plan depends on that credit.
 
@@ -839,7 +839,7 @@ Every line must read $0.00 or the design is wrong.
 ## 9. Open questions
 
 1. **Which Azure link is the primary demo?** Recommendation: keep Streamlit Cloud as the link on the résumé (always warm, instant), and present Azure as "also deployed on Azure with IaC and CI/CD" with its own link in the README. Best of both.
-2. ~~**Region.**~~ **Settled 2026-08-14: `eastus`.** Widest service availability and the lowest chance of a free-tier capacity error, which is a real failure mode for the Azure SQL free offer. Allowed by assumption B5.
+2. ~~**Region.**~~ **Settled 2026-08-14: `canadacentral`.** Initially settled as `eastus` on the reasoning that it has the widest service availability — which was wrong for this subscription. Azure SQL returns `ProvisioningDisabled` in both `eastus` and `eastus2` here, and the failure arrives 90 seconds into a deployment rather than at validation. Probe availability first with `az sql db list-editions -l <region> --edition GeneralPurpose --available`; **without `--available` the command lists Azure's global catalog and shows SKUs the subscription cannot provision**, which is exactly how `eastus` got chosen. `canadacentral`, `westus2` and `centralus` are all available; `canadacentral` is closest to Montreal. Container Apps and Storage were confirmed available there before committing.
 3. **Is the ETL job worth containerizing at all, versus running the load from GitHub Actions?** Actions would be simpler and equally free. The Container Apps Job is meaningfully more Azure-native — which is what you said you wanted — but it is roughly two extra evenings. Confirm you still want it.
 4. **Scheduled refresh — yes or no?** DOL publishes quarterly, so a monthly cron is mostly idle. It is three lines of Bicep and demonstrates orchestration. Recommendation: yes, as Step 12's optional extra.
 5. **Do you want a `dev` and `prod` environment split?** Realistic, and doubles both resource count and free-tier consumption. Recommendation: no. One environment, and say so in the README rather than pretending otherwise.

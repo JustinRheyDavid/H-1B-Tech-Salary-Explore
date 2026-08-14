@@ -7,7 +7,7 @@
 // measured usage is 175 MB of Parquet. The storage account itself costs nothing
 // to exist — you pay for what is stored and for transactions.
 
-@description('Azure region. Defaults to the resource group\'s location.')
+@description('Azure region. Required — deliberately has no default. See main.bicep: defaulting to resourceGroup().location would place resources in eastus, where Azure SQL cannot provision on this subscription.')
 param location string
 
 @description('Short project prefix. Storage account names allow only lowercase letters and digits, so this cannot contain the hyphen used elsewhere (h1b-web, h1b-etl).')
@@ -20,10 +20,15 @@ param namePrefix string
 param rawRetentionDays int
 
 // Storage account names are globally unique across all of Azure, 3-24 chars,
-// lowercase alphanumeric only. uniqueString() is deterministic per resource
-// group, so redeploying yields the same name rather than orphaning the old one.
+// lowercase alphanumeric only. uniqueString() is deterministic, so redeploying
+// yields the same name rather than orphaning the old one.
 // 'st' (2) + prefix (<=8) + uniqueString (13) stays inside 24.
-var storageAccountName = 'st${namePrefix}${uniqueString(resourceGroup().id)}'
+//
+// Seeded with `location` as well as the resource group, for the same reason as
+// the SQL server name in main.bicep: these are global DNS names, and a name
+// used in one region is not immediately reusable in another. Including the
+// region means a region change produces a fresh name instead of a collision.
+var storageAccountName = 'st${namePrefix}${uniqueString(resourceGroup().id, location)}'
 
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageAccountName
