@@ -13,6 +13,9 @@
         "operator": "GreaterThan",
         "threshold": 50,
         "contactEmails": ["justinrheydavid@gmail.com"],
+        "contactGroups": [
+          "/subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/microsoft.insights/actionGroups/ag-h1b-budget"
+        ],
         "thresholdType": "Actual"
       },
       "Actual_GreaterThan_80_Percent": {
@@ -20,6 +23,9 @@
         "operator": "GreaterThan",
         "threshold": 80,
         "contactEmails": ["justinrheydavid@gmail.com"],
+        "contactGroups": [
+          "/subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/microsoft.insights/actionGroups/ag-h1b-budget"
+        ],
         "thresholdType": "Actual"
       },
       "Actual_GreaterThan_100_Percent": {
@@ -27,6 +33,9 @@
         "operator": "GreaterThan",
         "threshold": 100,
         "contactEmails": ["justinrheydavid@gmail.com"],
+        "contactGroups": [
+          "/subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/microsoft.insights/actionGroups/ag-h1b-budget"
+        ],
         "thresholdType": "Actual"
       }
     }

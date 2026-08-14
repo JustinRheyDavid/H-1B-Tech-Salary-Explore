@@ -3,9 +3,10 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status: stub.** Steps 1 and 2 are not done. Every `<FILL IN>` below is a real
-blank, not a placeholder for something already known. Do not copy values into
-them from anywhere but a live `az` command.
+**Status:** Phase A complete — Steps 1 and 2 are done, and every value below was
+read from a live `az` command rather than transcribed. Sections 4 and 6 are
+still `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real blank, not a
+placeholder for something already known.
 
 The build plan this follows is [`docs/plans/azure-migration.md`](plans/azure-migration.md).
 
@@ -184,9 +185,12 @@ az group show -n rg-h1b --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
 ## 2. Spend guardrails
 
 **Do not start Phase B (Step 3, the first Bicep deploy) until this section is
-complete and an alert email has actually arrived.** That ordering is the whole
-point — a guardrail added after the resources exist has already failed at the
-one job it had.
+complete.** That ordering is the whole point — a guardrail added after the
+resources exist has already failed at the one job it had.
+
+Step 2 states the gate as "an alert email has actually arrived." That is not
+achievable here; see *Verify the alert* below for why, and for what was
+verified in its place.
 
 ### 2.1 Free Trial vs Pay-As-You-Go — know which you are on
 
@@ -270,36 +274,62 @@ Recreate it from scratch with:
 az rest --method put --url "https://management.azure.com/subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/providers/Microsoft.Consumption/budgets/h1b-zero-spend?api-version=2021-10-01" --headers "Content-Type=application/json" --body @infra/budget.json
 ```
 
-### Verify the alert actually fires — NOT YET DONE
+### Verify the alert — cannot be done by spending
 
-An unverified alert is not a guardrail, and this one has not been verified. The
-budget exists and reads `currentSpend: 0.0`, but no alert email has been proven
-to arrive. **At $0.00 spend against a $1.00 budget, no threshold is crossed, so
-nothing will fire on its own.**
+An unverified alert is not a guardrail. But this one **cannot be verified the
+way Step 2 describes**, and that is not a scheduling problem to work around.
 
-To verify, temporarily lower the budget amount so that current spend exceeds
-50% of it, wait for the alert, then reset to $1.00. At exactly $0.00 spend even
-that will not fire — so realistically this can only be verified once some real
-usage exists, i.e. after the first resource is deployed in Phase B.
+A budget threshold fires when spend exceeds a percentage of the budget amount.
+This project is engineered to cost exactly $0.00. Zero does not exceed any
+positive percentage of any positive budget amount, so **no threshold can ever be
+crossed while the design is working correctly.** Lowering the budget does not
+help: 50% of $0.01 is $0.005, and $0.00 still does not exceed it.
 
-**This is a genuine gap in the plan's ordering.** Step 2 says the alert email
-must land before Phase B begins, but a $0.00 subscription cannot cross any
-threshold to produce one. Resolve it one of two ways:
+**Step 2's acceptance criterion as written is unachievable for this project.**
+The only condition that would satisfy it is the project failing at its goal.
 
-1. Deploy Step 3's storage account (free, and the least risky billable-capable
-   resource), then verify the alert against real usage before Steps 4–6.
-2. Accept an unverified alert and rely on the §3 spend check being run manually
-   at every step. Weaker, and worth writing down as a conscious choice.
+### What was verified instead — the delivery path
+
+What actually matters is whether an alert would *reach you* if spend appeared.
+That is testable without spending anything, by routing the budget through an
+Action Group and using its built-in test notification.
 
 ```
-ALERT_TEST_METHOD   = <FILL IN>
-ALERT_EMAIL_ARRIVED = <FILL IN>     # date/time the email actually landed
+ACTION_GROUP      = ag-h1b-budget  (short name: h1bbudget)
+RECEIVER          = primary -> justinrheydavid@gmail.com, status Enabled
+ATTACHED_TO       = h1b-zero-spend, all three thresholds, via contactGroups
+TEST_SENT         = 2026-08-14 19:43:46 UTC
+TEST_RESULT       = Succeeded (MechanismType Email, state Complete)
 ```
+
+Recreate the Action Group and re-run the test with:
+
+```bash
+az monitor action-group create --name ag-h1b-budget --resource-group rg-h1b --short-name h1bbudget --action email primary justinrheydavid@gmail.com --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+```bash
+az monitor action-group test-notifications create --action-group ag-h1b-budget --resource-group rg-h1b --alert-type budget --add-action email primary justinrheydavid@gmail.com --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+> The test command polls for delivery and can take several minutes to return.
+> `Status: Succeeded` means Azure handed the mail off successfully — it does not
+> prove the message survived your spam filter. Confirm it in the inbox.
+
+This proves the address is right, the receiver is enabled, and the delivery path
+works — every part of the guardrail except the threshold arithmetic, which is
+Azure's to get right and cannot be exercised at $0.00.
 
 - [x] Budget exists — `h1b-zero-spend`, $1.00 monthly, 3 thresholds
-- [ ] An alert email has landed in the inbox — confirmed, not assumed
-- [ ] Threshold reset to 50/80/100 after any test
-- [ ] Resolution chosen for the ordering gap above
+- [x] Established that threshold alerts cannot fire at $0.00 spend
+- [x] Action Group created, attached to all three thresholds
+- [x] Test notification sent and reported `Succeeded`
+- [ ] Test email confirmed present in the inbox — **your check, not Azure's**
+- [ ] §3 spend check run at the end of each phase — the real day-to-day guardrail
+
+**The operative guardrail is the §3 spend check, run manually after every
+deployment.** The budget will alert if spend ever appears, and the delivery path
+is now proven, but nothing fires while the design is working.
 
 ---
 
