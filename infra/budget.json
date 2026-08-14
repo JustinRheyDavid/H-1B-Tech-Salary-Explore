@@ -1,0 +1,34 @@
+{
+  "properties": {
+    "category": "Cost",
+    "amount": 1.0,
+    "timeGrain": "Monthly",
+    "timePeriod": {
+      "startDate": "2026-08-01T00:00:00Z",
+      "endDate": "2030-08-01T00:00:00Z"
+    },
+    "notifications": {
+      "Actual_GreaterThan_50_Percent": {
+        "enabled": true,
+        "operator": "GreaterThan",
+        "threshold": 50,
+        "contactEmails": ["justinrheydavid@gmail.com"],
+        "thresholdType": "Actual"
+      },
+      "Actual_GreaterThan_80_Percent": {
+        "enabled": true,
+        "operator": "GreaterThan",
+        "threshold": 80,
+        "contactEmails": ["justinrheydavid@gmail.com"],
+        "thresholdType": "Actual"
+      },
+      "Actual_GreaterThan_100_Percent": {
+        "enabled": true,
+        "operator": "GreaterThan",
+        "threshold": 100,
+        "contactEmails": ["justinrheydavid@gmail.com"],
+        "thresholdType": "Actual"
+      }
+    }
+  }
+}

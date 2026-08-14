@@ -90,9 +90,13 @@ story, not a syntax exercise.
 
 ## 4. Architecture
 
-Resource names below keep the `prevailing-` prefix from this plan's original
-draft. They are Azure resource names, not product names, and nothing reads them
-but Bicep — but see §9.6 before committing to them.
+Resource names use the `h1b-` prefix, settled 2026-08-14 per §9.6 before any
+resource existed. The `prevailing-` prefix from this plan's original draft is
+gone from every Azure resource name.
+
+> The `prevailing_wage` column in §6 is **not** part of that rename. It is a DOL
+> data field — the wage floor an employer must pay — and shares nothing but a
+> word with the discarded project name.
 
 ```
  GitHub repo (JustinRheyDavid/H-1B-Tech-Salary-Explore)
@@ -103,11 +107,11 @@ but Bicep — but see §9.6 before committing to them.
    │
    └─────────────────────────────────────────────────────────────────────┐
                                                                           ▼
-  ┌──────────────────────────── Azure Resource Group: rg-prevailing ────────────────────────────┐
+  ┌──────────────────────────── Azure Resource Group: rg-h1b ───────────────────────────────────┐
   │                                                                                              │
   │   Blob Storage                 Container Apps Job              Azure SQL Database            │
   │   ┌──────────────┐   read      ┌──────────────────┐   write    ┌────────────────────┐        │
-  │   │ raw/  *.xlsx │ ──────────▶ │  prevailing-etl  │ ─────────▶ │  sqldb-prevailing  │        │
+  │   │ raw/  *.xlsx │ ──────────▶ │     h1b-etl      │ ─────────▶ │     sqldb-h1b      │        │
   │   │ curated/*.pq │ ◀────────── │  (manual trigger)│            │  serverless, free  │        │
   │   └──────────────┘   write     └──────────────────┘            │  auto-pause        │        │
   │                                         │                       └────────────────────┘        │
@@ -115,14 +119,14 @@ but Bicep — but see §9.6 before committing to them.
   │                                                                          │ read               │
   │                                            Container App                 │                    │
   │                                            ┌──────────────────┐          │                    │
-  │                                            │ prevailing-web   │ ─────────┘                    │
+  │                                            │ h1b-web          │ ─────────┘                    │
   │                                            │ Streamlit,       │                               │
   │                                            │ min replicas = 0 │                               │
   │                                            └──────────────────┘                               │
   │                                                     │ HTTPS                                   │
   └─────────────────────────────────────────────────────┼───────────────────────────────────────┘
                                                         ▼
-                                    https://prevailing-web.<region>.azurecontainerapps.io
+                                        https://h1b-web.<region>.azurecontainerapps.io
 ```
 
 ### Component ownership
@@ -199,11 +203,11 @@ Twelve steps in five phases. **Do not start Phase B until Step 2's budget alert 
 ### Step 1 — Create the Azure account
 **Files:** `docs/azure-runbook.md` (new, stub)
 
-Create a free Azure account. Record the subscription ID and tenant ID in the runbook. Create resource group `rg-prevailing` in the chosen region.
+Create a free Azure account. Record the subscription ID and tenant ID in the runbook. Create resource group `rg-h1b` in `eastus` (both settled per §9.2 and §9.6).
 
 Note honestly in the runbook: a credit card is required at signup, and the account starts with trial credit that expires. Nothing in this plan depends on that credit.
 
-**Done when:** `az account show` returns the subscription, and `az group show -n rg-prevailing` returns the group.
+**Done when:** `az account show` returns the subscription, and `az group show -n rg-h1b` returns the group.
 
 ---
 
@@ -267,8 +271,8 @@ Disabling SQL auth is deliberate — it makes password-based access impossible r
 **Files:** `infra/containerapps.bicep`
 
 - Consumption-only environment (no workload profiles, no VNet — both create charges)
-- `prevailing-web`: external ingress on port 8501, **`minReplicas: 0`**, `maxReplicas: 1`, system-assigned managed identity, 0.5 vCPU / 1 GiB
-- `prevailing-etl`: Container Apps **Job**, manual trigger type, 1 vCPU / 2 GiB, `replicaTimeout: 3600`, system-assigned managed identity
+- `h1b-web`: external ingress on port 8501, **`minReplicas: 0`**, `maxReplicas: 1`, system-assigned managed identity, 0.5 vCPU / 1 GiB
+- `h1b-etl`: Container Apps **Job**, manual trigger type, 1 vCPU / 2 GiB, `replicaTimeout: 3600`, system-assigned managed identity
 - Both point initially at `mcr.microsoft.com/k8se/quickstart:latest` as a placeholder; Step 9 swaps in the real images
 
 `minReplicas: 0` is what makes idle cost genuinely zero — idle charges only apply when minimum replicas is greater than zero.
@@ -286,13 +290,13 @@ Two grant paths, and they work differently:
 - **SQL:** cannot be done in Bicep. Connect as the Entra admin and run T-SQL:
 
 ```sql
-CREATE USER [prevailing-etl] FROM EXTERNAL PROVIDER;
-ALTER ROLE db_datawriter ADD MEMBER [prevailing-etl];
-ALTER ROLE db_datareader ADD MEMBER [prevailing-etl];
-GRANT CREATE TABLE TO [prevailing-etl];
+CREATE USER [h1b-etl] FROM EXTERNAL PROVIDER;
+ALTER ROLE db_datawriter ADD MEMBER [h1b-etl];
+ALTER ROLE db_datareader ADD MEMBER [h1b-etl];
+GRANT CREATE TABLE TO [h1b-etl];
 
-CREATE USER [prevailing-web] FROM EXTERNAL PROVIDER;
-ALTER ROLE db_datareader ADD MEMBER [prevailing-web];
+CREATE USER [h1b-web] FROM EXTERNAL PROVIDER;
+ALTER ROLE db_datareader ADD MEMBER [h1b-web];
 ```
 
 The web app gets **read-only**. It has no business writing.
@@ -423,7 +427,7 @@ Set `DB_BACKEND=azure` and `AZURE_SQL_SERVER` as environment variables on the co
 ### Step 11 — GitHub Actions with OIDC
 **Files:** `.github/workflows/ci.yml`, `.github/workflows/deploy.yml`
 
-Set up federated credentials: an Entra app registration with a federated credential scoped to `repo:JustinRheyDavid/H-1B-Tech-Salary-Explore:ref:refs/heads/main`, granted Contributor on `rg-prevailing`. The subject string is matched exactly and is case-sensitive; a wrong repo slug fails at token exchange with `AADSTS700213`, which does not name the subject it rejected. Store only `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` as repo variables — **no client secret exists**.
+Set up federated credentials: an Entra app registration with a federated credential scoped to `repo:JustinRheyDavid/H-1B-Tech-Salary-Explore:ref:refs/heads/main`, granted Contributor on `rg-h1b`. The subject string is matched exactly and is case-sensitive; a wrong repo slug fails at token exchange with `AADSTS700213`, which does not name the subject it rejected. Store only `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` as repo variables — **no client secret exists**.
 
 - `ci.yml`: on pull request — `pytest` against SQLite, plus `ruff`. `data/h1b.db` is committed, so the query and app suites run in CI with no setup; `tests/test_pipeline_numbers.py` skips itself, since `data/raw/` is gitignored. That skip is correct in CI and is also the one that lets a wrong Parquet cache through locally — the runbook should say so.
 - `deploy.yml`: on push to `main` — `azure/login@v2` with OIDC, build both images, push to GHCR, `az deployment group create`, then `az containerapp update` to roll the new image
@@ -435,7 +439,7 @@ Set up federated credentials: an Entra app registration with a federated credent
 ### Step 12 — Runbook, README, and teardown
 **Files:** `docs/azure-runbook.md`, `README.md`
 
-Runbook must cover: redeploy from scratch, refresh data with a new DOL quarter, check current spend, what to do if the budget alert fires, and **how to tear the whole thing down** (`az group delete -n rg-prevailing --yes`).
+Runbook must cover: redeploy from scratch, refresh data with a new DOL quarter, check current spend, what to do if the budget alert fires, and **how to tear the whole thing down** (`az group delete -n rg-h1b --yes`).
 
 README gains an "Architecture on Azure" section with the §4 diagram, both live links (Streamlit Cloud and Azure), and a short "Why these services" paragraph naming the free-tier limits — that paragraph is what shows a reviewer you understand cloud cost, which is a thing hiring managers worry about with junior engineers.
 
@@ -835,11 +839,11 @@ Every line must read $0.00 or the design is wrong.
 ## 9. Open questions
 
 1. **Which Azure link is the primary demo?** Recommendation: keep Streamlit Cloud as the link on the résumé (always warm, instant), and present Azure as "also deployed on Azure with IaC and CI/CD" with its own link in the README. Best of both.
-2. **Region.** `eastus` has the widest service availability and lowest chance of a free-tier capacity error. Any reason to prefer somewhere closer to you?
+2. ~~**Region.**~~ **Settled 2026-08-14: `eastus`.** Widest service availability and the lowest chance of a free-tier capacity error, which is a real failure mode for the Azure SQL free offer. Allowed by assumption B5.
 3. **Is the ETL job worth containerizing at all, versus running the load from GitHub Actions?** Actions would be simpler and equally free. The Container Apps Job is meaningfully more Azure-native — which is what you said you wanted — but it is roughly two extra evenings. Confirm you still want it.
 4. **Scheduled refresh — yes or no?** DOL publishes quarterly, so a monthly cron is mostly idle. It is three lines of Bicep and demonstrates orchestration. Recommendation: yes, as Step 12's optional extra.
 5. **Do you want a `dev` and `prod` environment split?** Realistic, and doubles both resource count and free-tier consumption. Recommendation: no. One environment, and say so in the README rather than pretending otherwise.
-6. **Resource naming — `prevailing-*` or `h1b-*`?** This plan was drafted when the project was going to be called Prevailing. It is called the H-1B Tech Salary Explorer everywhere a person can see: the repo, the page title, the README. The Azure resource names are the last place the old name survives, and they are cheap to change now and annoying to change after Step 11's federated credential and Step 6's manual SQL grants both name them. Recommendation: rename to `rg-h1b`, `h1b-web`, `h1b-etl` at Step 3, before anything exists. Decide before Phase B.
+6. ~~**Resource naming — `prevailing-*` or `h1b-*`?**~~ **Settled 2026-08-14: `h1b-*`.** `rg-h1b`, `h1b-web`, `h1b-etl`, `sqldb-h1b`, decided before any resource existed and applied throughout this plan. "Prevailing" was a working title the project never used — it is the H-1B Tech Salary Explorer in the repo, the page title, and the README, and the Azure resource names were the last place the old name survived. Note that the `prevailing_wage` column in §6 is a DOL data field and was correctly **not** renamed.
 
 ---
 
