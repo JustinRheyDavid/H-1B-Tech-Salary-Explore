@@ -1,0 +1,43 @@
+{
+  "properties": {
+    "category": "Cost",
+    "amount": 1.0,
+    "timeGrain": "Monthly",
+    "timePeriod": {
+      "startDate": "2026-08-01T00:00:00Z",
+      "endDate": "2030-08-01T00:00:00Z"
+    },
+    "notifications": {
+      "Actual_GreaterThan_50_Percent": {
+        "enabled": true,
+        "operator": "GreaterThan",
+        "threshold": 50,
+        "contactEmails": ["justinrheydavid@gmail.com"],
+        "contactGroups": [
+          "/subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/microsoft.insights/actionGroups/ag-h1b-budget"
+        ],
+        "thresholdType": "Actual"
+      },
+      "Actual_GreaterThan_80_Percent": {
+        "enabled": true,
+        "operator": "GreaterThan",
+        "threshold": 80,
+        "contactEmails": ["justinrheydavid@gmail.com"],
+        "contactGroups": [
+          "/subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/microsoft.insights/actionGroups/ag-h1b-budget"
+        ],
+        "thresholdType": "Actual"
+      },
+      "Actual_GreaterThan_100_Percent": {
+        "enabled": true,
+        "operator": "GreaterThan",
+        "threshold": 100,
+        "contactEmails": ["justinrheydavid@gmail.com"],
+        "contactGroups": [
+          "/subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/microsoft.insights/actionGroups/ag-h1b-budget"
+        ],
+        "thresholdType": "Actual"
+      }
+    }
+  }
+}
