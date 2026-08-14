@@ -359,8 +359,17 @@ Azure's to get right and cannot be exercised at $0.00.
 - [x] Established that threshold alerts cannot fire at $0.00 spend
 - [x] Action Group created, attached to all three thresholds
 - [x] Test notification sent and reported `Succeeded`
-- [ ] Test email confirmed present in the inbox — **your check, not Azure's**
+- [x] **Test email confirmed received, 2026-08-14** — checked in the inbox, not
+      inferred from Azure's `Succeeded` status
 - [ ] §3 spend check run at the end of each phase — the real day-to-day guardrail
+
+The Action Group is defined in `infra/monitoring.bicep`, not created by hand.
+That matters because Step 12's teardown is `az group delete -n rg-h1b`, which
+destroys everything in the resource group. The budget is subscription-scoped and
+survives, but it references the Action Group by resource ID — a hand-created one
+would leave the budget pointing at a dangling ID after any teardown, silently
+losing the notification path that was just verified. Recreating the environment
+now recreates the alerting with it.
 
 **The operative guardrail is the §3 spend check, run manually after every
 deployment.** The budget will alert if spend ever appears, and the delivery path
@@ -537,6 +546,24 @@ Client with IP address 'x.x.x.x' is not allowed to access the server.
 
 Re-run the deploy with that value. Changes take up to five minutes to apply.
 A changed home IP is the usual cause of a connection that worked yesterday.
+
+> **The rule is never removed by the template.** ARM incremental deployments do
+> not delete resources absent from a template, so the conditional only ever
+> creates. Deploying later *without* `clientIpAddress` leaves the rule in place
+> and `what-if` reports "no change" without mentioning it — verified 2026-08-14.
+>
+> Two consequences. A mistyped address is permanent: the parameter is an
+> unvalidated string, `not-an-ip` passes `az deployment group validate`, and a
+> well-formed wrong address silently admits somebody else's machine. And because
+> ISPs reassign residential addresses, a stale rule eventually grants network
+> reach to a stranger — Entra-only auth still blocks login, but the opening is
+> pointless.
+>
+> Removal is manual, and belongs in the teardown checklist:
+>
+> ```bash
+> az sql server firewall-rule delete -g rg-h1b -s sql-h1b-hutymqa65yoty -n ClientDevelopmentMachine --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+> ```
 
 #### Compatibility level
 

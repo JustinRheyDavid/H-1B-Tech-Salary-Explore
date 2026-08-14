@@ -10,8 +10,15 @@
 //   minCapacity                 0.5     smallest serverless floor
 //   maxSizeBytes                32 GiB  the free storage allowance
 //
-// Only ONE free-offer database is allowed per subscription. If a second is ever
-// created, the deployment fails rather than silently billing.
+// UNVERIFIED: Azure documents one free-offer database per subscription, and the
+// assumption elsewhere in this project is that attempting a second one fails
+// rather than silently billing. That has NOT been tested here, because the only
+// way to test it is to create a second database and risk the exact charge the
+// rule is supposed to prevent. Do not rely on it as a safety net.
+//
+// It is reachable by accident: `databaseName` derives from `namePrefix` in
+// main.bicep, so changing that parameter creates a second database rather than
+// renaming this one — ARM incremental deployments never delete the old.
 
 @description('Azure region.')
 param location string
@@ -107,6 +114,22 @@ resource allowAzureServices 'Microsoft.Sql/servers/firewallRules@2023-08-01-prev
 
 // Only created when an address is supplied at deploy time. See the parameter
 // description for why there is no default.
+//
+// WARNING — this condition only ever CREATES. ARM incremental deployments do
+// not delete resources absent from a template, so once this rule exists, later
+// deployments that omit clientIpAddress leave it in place and `what-if` reports
+// "no change" without mentioning it. Two consequences:
+//
+//   1. A mistyped address is permanent until removed by hand. The parameter is
+//      an unvalidated string; 'not-an-ip' passes `az deployment group validate`,
+//      and a well-formed wrong address (a digit dropped) silently admits
+//      somebody else's machine.
+//   2. Home IP addresses get reassigned by ISPs, so a stale rule eventually
+//      grants network reach to a stranger. Entra-only auth still blocks login,
+//      but the opening is unnecessary.
+//
+// Removal is manual and belongs in the teardown checklist:
+//   az sql server firewall-rule delete -g rg-h1b -s <server> -n ClientDevelopmentMachine
 resource allowClientIp 'Microsoft.Sql/servers/firewallRules@2023-08-01-preview' = if (!empty(clientIpAddress)) {
   parent: sqlServer
   name: 'ClientDevelopmentMachine'

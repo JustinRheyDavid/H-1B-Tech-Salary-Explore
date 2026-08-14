@@ -16,6 +16,9 @@
     },
     "entraAdminLogin": {
       "value": "justinrheydavid_gmail.com#EXT#@justinrheydavidgmail.onmicrosoft.com"
+    },
+    "alertEmailAddress": {
+      "value": "justinrheydavid@gmail.com"
     }
   }
 }

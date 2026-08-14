@@ -7,7 +7,7 @@
 // measured usage is 175 MB of Parquet. The storage account itself costs nothing
 // to exist — you pay for what is stored and for transactions.
 
-@description('Azure region. Defaults to the resource group\'s location.')
+@description('Azure region. Required — deliberately has no default. See main.bicep: defaulting to resourceGroup().location would place resources in eastus, where Azure SQL cannot provision on this subscription.')
 param location string
 
 @description('Short project prefix. Storage account names allow only lowercase letters and digits, so this cannot contain the hyphen used elsewhere (h1b-web, h1b-etl).')

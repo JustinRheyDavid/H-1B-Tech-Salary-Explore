@@ -1,9 +1,12 @@
 // Entry point for the H-1B Tech Salary Explorer infrastructure.
 //
-// Deployed at resource group scope into rg-h1b (eastus). Modules are added as
-// the plan's phases land:
+// Deployed at resource group scope into rg-h1b. Every resource lives in
+// canadacentral; rg-h1b's own location is eastus, but a resource group's
+// location is metadata only and does not constrain its contents. Modules are
+// added as the plan's phases land:
 //
-//   Step 3  storage.bicep         <- this deployment
+//   Step 2  monitoring.bicep      <- Action Group for budget alerts
+//   Step 3  storage.bicep
 //   Step 4  sql.bicep
 //   Step 5  containerapps.bicep
 //
@@ -50,6 +53,16 @@ param entraAdminLogin string
 @description('Single IPv4 address allowed through the SQL firewall for local development. Empty by default — pass it at deploy time, do not commit it.')
 param clientIpAddress string = ''
 
+@description('Email address that budget alerts are delivered to.')
+param alertEmailAddress string
+
+module monitoring 'monitoring.bicep' = {
+  name: 'monitoring'
+  params: {
+    alertEmailAddress: alertEmailAddress
+  }
+}
+
 module storage 'storage.bicep' = {
   name: 'storage'
   params: {
@@ -86,3 +99,7 @@ output storageAccountName string = storage.outputs.storageAccountName
 output blobEndpoint string = storage.outputs.blobEndpoint
 output sqlServerFqdn string = sql.outputs.sqlServerFqdn
 output databaseName string = sql.outputs.databaseName
+
+// infra/budget.json hardcodes this ID in its contactGroups. If the Action Group
+// is ever renamed or moved, that file must be updated and the budget re-applied.
+output actionGroupId string = monitoring.outputs.actionGroupId
