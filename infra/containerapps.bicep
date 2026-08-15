@@ -19,25 +19,31 @@ param location string
 @description('Short project prefix. Container app names allow lowercase letters, digits and hyphens.')
 param namePrefix string
 
-@description('Container image for both the web app and the ETL job. Step 9 replaces this with the real images built from Dockerfile.web and Dockerfile.etl.')
-param containerImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
+// The web app and the ETL job take SEPARATE images. They were briefly a single
+// parameter, which could not express the required end state: Step 9 pushes
+// ghcr.io/.../h-1b-tech-salary-explore-etl:latest while Step 10 builds a
+// different image from Dockerfile.web. One parameter would have forced editing
+// this file at Step 9 — exactly what parameterising is meant to avoid.
+//
+// None of the three has a default, deliberately. The web image and its port must
+// agree, and a wrong pairing does NOT fail the deployment: ARM reports Succeeded,
+// the revision sits in `Activating`, and requests to the FQDN hang with no
+// response. That is precisely how plan Step 5's own combination behaves —
+// targetPort 8501 against the port-80 quickstart placeholder — and it was
+// observed here before this was fixed.
+//
+// A missing required parameter fails loudly at deploy time and names itself. A
+// plausible-looking default fails silently at runtime. Requiring all three means
+// Step 9 and Step 10 cannot swap an image while forgetting its port, because
+// every value must be stated in infra/main.parameters.json.
+@description('Image for the Streamlit web app. Placeholder until Step 10 builds the real one from Dockerfile.web.')
+param webImage string
 
-// DEVIATION FROM PLAN STEP 5, which specifies targetPort 8501 while also
-// specifying mcr.microsoft.com/k8se/quickstart:latest as the placeholder image.
-// Those two are incompatible: the quickstart image serves on port 80, so with
-// targetPort 8501 nothing ever accepts a connection, the revision sits in
-// `Activating` forever, and requests to the FQDN hang. Step 5's own acceptance
-// criterion — "the placeholder web app returns a page over HTTPS" — cannot be
-// met with both values as written. Observed exactly that before parameterising.
-//
-// The port is a property of the image, so it travels with the image rather than
-// being hardcoded. Step 9 sets both together:
-//
-//   --parameters containerImage=ghcr.io/.../h1b-web:latest targetPort=8501
-//
-// 8501 is Streamlit's default and remains correct for the real image.
-@description('Port the web container listens on. Must match containerImage: 80 for the quickstart placeholder, 8501 for the real Streamlit image.')
-param targetPort int = 80
+@description('Port the web container listens on. MUST match webImage: 80 for the quickstart placeholder, 8501 for the real Streamlit image.')
+param webTargetPort int
+
+@description('Image for the ETL job. Placeholder until Step 9 builds the real one from Dockerfile.etl.')
+param etlImage string
 
 // No appLogsConfiguration is declared, so the environment has no log
 // destination. This is deliberate: a Log Analytics workspace is billable past
@@ -98,10 +104,10 @@ resource webApp 'Microsoft.App/containerApps@2024-03-01' = {
     configuration: {
       ingress: {
         external: true
-        // Must match what containerImage actually listens on — see the
+        // Must match what webImage actually listens on — see the
         // targetPort parameter. A mismatch does not fail the deployment; the
         // revision reports Succeeded and then hangs in Activating.
-        targetPort: targetPort
+        targetPort: webTargetPort
         transport: 'auto'
         allowInsecure: false
         // 0 means "not a TCP exposed port". Server-set; declared for what-if.
@@ -118,7 +124,7 @@ resource webApp 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'web'
-          image: containerImage
+          image: webImage
           resources: {
             // Container Apps requires memory in Gi and constrains the ratio to
             // 2 Gi per CPU. 0.5 CPU therefore pairs with exactly 1 Gi.
@@ -152,6 +158,12 @@ resource etlJob 'Microsoft.App/jobs@2024-03-01' = {
     configuration: {
       // Triggered by hand per assumption B7. Step 12 optionally moves this to
       // a schedule.
+      //
+      // WARNING while etlImage is the quickstart placeholder: that image serves
+      // HTTP and never exits, so a manual trigger runs the full replicaTimeout
+      // below — one hour at 1 vCPU, 3,600 vCPU-seconds, 2% of the monthly free
+      // grant burned for nothing. Do not start this job until Step 9 supplies an
+      // image that terminates.
       triggerType: 'Manual'
       // One hour. Loading 850,321 rows with fast_executemany is comfortably
       // inside this; plan §8's fallback is one fiscal year per execution.
@@ -166,7 +178,7 @@ resource etlJob 'Microsoft.App/jobs@2024-03-01' = {
       containers: [
         {
           name: 'etl'
-          image: containerImage
+          image: etlImage
           resources: {
             cpu: json('1.0')
             memory: '2Gi'

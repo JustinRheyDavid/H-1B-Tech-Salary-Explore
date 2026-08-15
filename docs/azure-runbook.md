@@ -605,15 +605,38 @@ h1b-etl  7cb7a8f0-0417-402c-8971-ee3ca66137a2   (SystemAssigned, gets db_datawri
 > `az containerapp show -n h1b-web -g rg-h1b --query identity.principalId -o tsv`
 > before running Step 6's grants.
 
-#### `minReplicas: 0` is the whole cost story
+#### `minReplicas: 0` is the whole cost story — and it demonstrably works
 
-Verified on the deployed app: `minReplicas 0`, `maxReplicas 1`, 0.5 CPU / 1 Gi.
-Idle charges begin the moment minimum replicas exceeds zero, so this is the
-single most expensive value in `infra/containerapps.bicep`. Plan §7 lists raising
-it as the second most likely way this project starts costing money.
+Configured `minReplicas 0`, `maxReplicas 1`, 0.5 CPU / 1 Gi. Idle charges begin
+the moment minimum replicas exceeds zero, so this is the single most expensive
+value in `infra/containerapps.bicep`. Plan §7 lists raising it as the second most
+likely way this project starts costing money.
 
-The consequence is a cold start on the first request after idle — expected, not a
-bug. Plan §8 puts it at 20–30 seconds and recommends saying so next to the link.
+**Verified by observation, not by reading the setting.** After a no-traffic
+window the app reports:
+
+```
+Replicas    State
+----------  ------------
+0           ScaledToZero
+```
+
+```bash
+az containerapp revision list -n h1b-web -g rg-h1b --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 --query "[?properties.active].{replicas:properties.replicas, state:properties.runningState}" -o table
+```
+
+Checking this properly matters, and it is easy to get wrong. Control-plane `az`
+calls do **not** wake the app, but any `curl` to the FQDN does, and the scale
+block's `cooldownPeriod` is 300 s — so a check within five minutes of the last
+request will show a replica still running and prove nothing. Wait out the full
+cooldown with no HTTP requests before drawing a conclusion. An earlier review of
+this project concluded the app "never scales to zero" by sampling too soon and
+by reading a replica that something else had woken; the correct reading is above.
+
+The real consequence of scale-to-zero is a cold start on the first request after
+idle — expected, not a bug. Plan §8 puts it at 20–30 seconds. **That figure is
+inherited from the plan and has not been measured here** — the only timings taken
+were warm (~0.07 s).
 
 #### The environment has no log destination
 
@@ -629,20 +652,41 @@ What is lost is queryable history — you cannot ask why a container died an hou
 ago. If Step 9's ODBC install proves hard to debug (plan §8 rates that risk
 medium-high), adding a workspace is a small reversible change.
 
-#### Deviation: targetPort is a parameter, defaulting to 80
+#### Deviation: three required image/port parameters, no defaults
 
 Step 5 specifies `targetPort: 8501` **and** the quickstart placeholder image.
 Those contradict each other — the quickstart image serves on port 80, so with
 8501 nothing accepts a connection, the revision sits in `Activating`
 indefinitely, and requests to the FQDN hang with no response. Observed exactly
-that on the first deploy; the ARM deployment still reported `Succeeded`.
+that on the first deploy; **the ARM deployment still reported `Succeeded`.**
 
-The port is a property of the image, so it now travels with the image. Step 9
-sets both together:
+The web app and the ETL job also need *separate* images — Step 9 builds from
+`Dockerfile.etl`, Step 10 from `Dockerfile.web` — so a single image parameter
+could not express the required end state at all.
 
-```bash
---parameters containerImage=ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest targetPort=8501
+So there are three parameters, and **none has a default**:
+
 ```
+webImage       what the Streamlit app runs
+webTargetPort  the port webImage listens on — 80 placeholder, 8501 Streamlit
+etlImage       what the ETL job runs
+```
+
+All three live in `infra/main.parameters.json`. Requiring them is the point: a
+missing parameter fails at validation and names itself —
+
+```
+ERROR: Missing input parameters: webTargetPort
+```
+
+— whereas a plausible default fails *silently at runtime*, which is the failure
+mode above. Step 9 and Step 10 change an image and its port together in the
+parameters file; neither can be swapped while forgetting the other.
+
+> **Do not trigger the ETL job while `etlImage` is the placeholder.** The
+> quickstart image serves HTTP and never exits, so a manual run consumes the
+> full `replicaTimeout` — one hour at 1 vCPU, 3,600 vCPU-seconds, 2% of the
+> monthly free grant, for nothing.
 
 #### `what-if` does not reach zero changes here, and cannot
 
@@ -657,7 +701,7 @@ baseline for this resource, and investigate anything else.
 - [x] Environment provisioned, Consumption-only, no VNet
 - [x] Web app returns **HTTP 200 over HTTPS** at its FQDN — 4,331 bytes of HTML
 - [x] `az containerapp job list` shows `h1b-etl`, Manual, timeout 3600
-- [x] `minReplicas: 0` confirmed on the deployed app
+- [x] `minReplicas: 0` confirmed **and scale-to-zero observed** — `0 replicas, ScaledToZero` after the cooldown
 - [x] Both managed identities exist with principal IDs recorded above
 - [x] Spend after deployment still `$0.00`
 

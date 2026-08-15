@@ -95,11 +95,23 @@ module sql 'sql.bicep' = {
   }
 }
 
+@description('Image for the Streamlit web app. Step 10 replaces the placeholder.')
+param webImage string
+
+@description('Port the web container listens on. Must match webImage — 80 for the placeholder, 8501 for the real Streamlit image.')
+param webTargetPort int
+
+@description('Image for the ETL job. Step 9 replaces the placeholder.')
+param etlImage string
+
 module containerapps 'containerapps.bicep' = {
   name: 'containerapps'
   params: {
     location: location
     namePrefix: namePrefix
+    webImage: webImage
+    webTargetPort: webTargetPort
+    etlImage: etlImage
   }
 }
 
