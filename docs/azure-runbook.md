@@ -3,10 +3,10 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–5 done. Every value below was read from a live `az` command
-or a real SQL connection rather than transcribed. The data path (Step 7 onward)
-and teardown are still `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real
-blank, not a placeholder for something already known.
+**Status:** Steps 1–7 done. Every value below was read from a live `az` command
+or a real SQL connection rather than transcribed. The rest of the data path
+(Step 8 onward) and teardown are still `<TO BE WRITTEN>`; any remaining
+`<FILL IN>` is a real blank, not a placeholder for something already known.
 
 The build plan this follows is [`docs/plans/azure-migration.md`](plans/azure-migration.md).
 
@@ -907,16 +907,8 @@ plan §8 budgets ~60 seconds.
 
 #### What this step does NOT cover
 
-**Step 7 will hit a wall.** Uploading raw data to Blob needs
-`Storage Blob Data Contributor` for *you*, and you do not have it. Subscription
-Owner is control-plane only — it lets you delete the storage account but not read
-a blob in it — and `allowSharedKeyAccess: false` removes the account-key
-fallback. The symptom is `AuthorizationPermissionMismatch`. It is deliberately
-not in `roles.bicep`, which grants managed identities, not people:
-
-```bash
-az role assignment create --assignee 8ff2eb8b-1fe8-4bb1-9e8f-1a434ee951a8 --role "Storage Blob Data Contributor" --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/Microsoft.Storage/storageAccounts/sth1bhutymqa65yoty
-```
+**The operator needs a blob grant too — granted 2026-08-17, see below.** It is
+deliberately not in `roles.bicep`, which grants managed identities, not people.
 
 Neither identity's SQL access has been proven from the workload itself. The
 grants are verified by impersonation from an admin session; an actual
@@ -932,11 +924,181 @@ image. Impersonation tests the permissions, not the token path.
 - [x] Runbook records that the SQL half is manual and must be repeated after a database recreate
 - [x] Spend after deployment still `$0.00`
 
+### Step 7 prerequisite — operator blob access, DONE 2026-08-17
+
+Step 6 grants the *machines*. This grants the *person*, and without it Step 7
+cannot upload a single byte.
+
+**Subscription Owner does not let you read a blob.** Owner is a control-plane
+role: it lets you delete the whole storage account but not list what is inside
+it. `allowSharedKeyAccess: false` (Step 3) removes the account-key fallback that
+would otherwise paper over this. Verified before granting anything — as Owner:
+
+```
+ERROR:
+You do not have the required permissions needed to perform this operation.
+Depending on your operation, you may need to be assigned one of the following roles:
+    "Storage Blob Data Owner"
+    "Storage Blob Data Contributor"
+    "Storage Blob Data Reader"
+```
+
+The fix, scoped to the storage account rather than the subscription:
+
+```bash
+az role assignment create --assignee 8ff2eb8b-1fe8-4bb1-9e8f-1a434ee951a8 --role "Storage Blob Data Contributor" --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/Microsoft.Storage/storageAccounts/sth1bhutymqa65yoty --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+Confirmed working afterwards — note `--auth-mode login`, which forces the data
+plane to use your Entra token instead of looking for an account key that does not
+exist:
+
+```bash
+az storage container list --account-name sth1bhutymqa65yoty --auth-mode login --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 --query "[].name" -o tsv
+```
+
+```
+curated
+raw
+```
+
+> **This grant is manual and per-person, like the SQL grants and for the same
+> reason.** It is not in `roles.bicep` — that file grants managed identities, and
+> a human's object ID does not belong in infrastructure code that a second
+> contributor would also deploy. Consequences to remember:
+>
+> - **Recreating the storage account drops it.** The account name is seeded with
+>   `uniqueString(resourceGroup().id, location)`, so it survives a normal
+>   redeploy — but a teardown and rebuild means re-running the command above.
+> - **Anyone else working on this needs their own.** Substitute their object ID
+>   from `az ad signed-in-user show --query id -o tsv`.
+> - **Symptom if it is missing:** `AuthorizationPermissionMismatch`, or the
+>   permissions error quoted above. It does not mean the storage account is
+>   misconfigured.
+
 ### Data
 
-<!-- Step 7 onward. Not written yet. -->
+### Step 7 — Raw data in Blob Storage, DONE 2026-08-17
 
-`<TO BE WRITTEN>`
+```
+CONTAINER = raw
+CONTENTS  = 9 blobs, 183,274,578 bytes (174.8 MiB)
+SOURCE    = data/interim/*.parquet, built from data/raw/*.xlsx by src/ingest.py
+CODE      = src/etl/blob.py
+```
+
+Every blob's size was compared against its local file — all nine match exactly,
+and there is nothing else in the container.
+
+#### The Parquet cache, not the spreadsheets
+
+`data/raw/` holds nine `.xlsx` totalling 851 MB. `data/interim/` holds the nine
+Parquet conversions at 175 MB — 4.9x smaller, not the 10x plan §5 guessed. Both
+fit the free 5 GB, but the loader reads Parquet anyway, and re-reading the
+spreadsheets costs ~15 minutes against seconds for the cache.
+
+#### Upload and inspect
+
+```bash
+python -m src.etl.blob upload
+```
+
+Re-runnable: it skips blobs already present at the same size, so an interrupted
+upload resumes rather than restarting. `--force` overrides that.
+
+```bash
+python -m src.etl.blob list
+```
+
+Or through the CLI — note `--auth-mode login`, which forces the data plane onto
+your Entra token instead of hunting for an account key that does not exist:
+
+```bash
+az storage blob list --account-name sth1bhutymqa65yoty -c raw --auth-mode login --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 -o table
+```
+
+#### The first upload failed and reported success
+
+Two things went wrong together, and the second hid the first.
+
+**The upload died on the third file:**
+
+```
+azure.core.exceptions.ServiceResponseError:
+    ('Connection aborted.', TimeoutError('The write operation timed out'))
+```
+
+The SDK's default `max_single_put_size` is 64 MiB. Every cache file is 13–33
+MiB, so all nine sat *under* that threshold and went as **one PUT each** — a
+single request carrying 28 MiB up a domestic uplink, with nothing to retry but
+the entire file, and `max_concurrency` doing nothing because there was only ever
+one part. `src/etl/blob.py` now sets `max_single_put_size` and `max_block_size`
+to 8 MiB, so uploads chunk into retryable blocks. The retry then carried the same
+28 MiB file without incident.
+
+**And it exited 0 anyway**, because the command was piped:
+
+```bash
+python -m src.etl.blob upload | tail -15     # exit code is tail's, not Python's
+```
+
+Same defect as `sqlcmd` without `-b` in Step 6 — a failing command reporting
+success because something downstream succeeded. Run it unpiped, or check
+`${PIPESTATUS[0]}`.
+
+#### `probe.parquet` is a trap
+
+`data/interim/` also contains `probe.parquet`, a 1.6 KB leftover. A bare
+`*.parquet` glob uploads it as a tenth blob and quietly breaks this step's own
+acceptance count. `blob.cache_files` matches `LCA_*.parquet` — a glob so DOL's
+misspelled `LCA_Dislclosure_Data_FY2026_Q2` is not dropped, and a prefix so build
+artefacts are not swept in. `tests/test_blob.py` covers both directions.
+
+#### These blobs expire in 90 days
+
+`storage.bicep`'s lifecycle rule deletes anything under `raw/` after
+`rawRetentionDays`. Deliberate — the cache is rebuildable — but an ETL run in
+late November finds an **empty container, not a permission error**. The fix is to
+upload again, not to debug access.
+
+#### Round trip verified
+
+`download_raw` was checked by SHA-256, not by size:
+
+```
+local     13,601,464 bytes  24e48aa9fe4786f6
+roundtrip 13,601,464 bytes  24e48aa9fe4786f6
+IDENTICAL
+reads back as a DataFrame: 99,692 rows x 97 cols
+```
+
+Downloads land on a scratch path and are renamed into place, so an interrupted
+download cannot leave a half-file wearing the real name — which pandas would
+report as corruption somewhere much less obvious.
+
+#### Tests write to `curated`, never `raw`
+
+The `azure`-marked tests round-trip through the `curated` container on purpose.
+The contents of `raw` are this step's acceptance criterion, and a test that adds
+and removes blobs there is one crashed process away from invalidating the count
+it exists to protect. `test_raw_holds_exactly_the_nine_dol_caches` asserts that
+count directly.
+
+Run them with `pytest -m azure`; they skip automatically with no SDK, no login,
+or no network.
+
+> **Spend has NOT been confirmed for this step yet.** The budget reads `$0.00`,
+> but Azure consumption data lags roughly 24 hours, so a figure read minutes
+> after uploading cannot reflect it. This is the project's first genuinely
+> at-rest billable resource — 175 MB of Hot LRS. **Re-check on 2026-08-18** and
+> record the result here rather than treating today's zero as confirmation.
+
+- [x] `raw` contains exactly nine blobs, no extras
+- [x] Total 174.8 MiB, every blob byte-size matching its local file
+- [x] `download_raw` round-trips SHA-256-identical and the file parses as Parquet
+- [x] Upload is resumable — verified by an interrupted run that skipped what it had already done
+- [x] 243 tests pass
+- [ ] Spend re-checked 2026-08-18 — **pending, see above**
 
 ---
 
