@@ -19,6 +19,15 @@
     },
     "alertEmailAddress": {
       "value": "justinrheydavid@gmail.com"
+    },
+    "webImage": {
+      "value": "mcr.microsoft.com/k8se/quickstart:latest"
+    },
+    "webTargetPort": {
+      "value": 80
+    },
+    "etlImage": {
+      "value": "mcr.microsoft.com/k8se/quickstart:latest"
     }
   }
 }

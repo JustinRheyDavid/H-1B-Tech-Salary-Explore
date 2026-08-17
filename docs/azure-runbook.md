@@ -3,7 +3,7 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–4 done. Every value below was read from a live `az` command
+**Status:** Steps 1–5 done. Every value below was read from a live `az` command
 or a real SQL connection rather than transcribed. The data path (Step 7 onward)
 and teardown are still `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real
 blank, not a placeholder for something already known.
@@ -583,6 +583,140 @@ syntax error in the SQL rather than a database setting.
 - [x] Entra-only authentication confirmed `true`
 - [x] Connected over Entra auth with no password
 - [x] Compatibility level 170 ≥ 160
+- [x] Spend after deployment still `$0.00`
+
+### Step 5 — Container Apps, DONE 2026-08-14
+
+```
+ENVIRONMENT = h1b-env            (Consumption-only, no VNet)
+WEB APP     = h1b-web            https://h1b-web.calmwave-8f560d92.canadacentral.azurecontainerapps.io
+ETL JOB     = h1b-etl            Manual trigger, replicaTimeout 3600
+IMAGE       = mcr.microsoft.com/k8se/quickstart:latest  (placeholder; Step 9 replaces)
+```
+
+Managed identity principal IDs — **Step 6 needs both**:
+
+```
+h1b-web  b16f09c9-0791-487c-8801-baa35d3435bd   (SystemAssigned, gets db_datareader)
+h1b-etl  7cb7a8f0-0417-402c-8971-ee3ca66137a2   (SystemAssigned, gets db_datawriter + blob contributor)
+```
+
+> These change if the app or job is deleted and recreated. Re-read them with
+> `az containerapp show -n h1b-web -g rg-h1b --query identity.principalId -o tsv`
+> before running Step 6's grants.
+
+#### `minReplicas: 0` is the whole cost story — and it demonstrably works
+
+Configured `minReplicas 0`, `maxReplicas 1`, 0.5 CPU / 1 Gi. Idle charges begin
+the moment minimum replicas exceeds zero, so this is the single most expensive
+value in `infra/containerapps.bicep`. Plan §7 lists raising it as the second most
+likely way this project starts costing money.
+
+**Verified by observation, not by reading the setting.** After a no-traffic
+window the app reports:
+
+```
+Replicas    State
+----------  ------------
+0           ScaledToZero
+```
+
+```bash
+az containerapp revision list -n h1b-web -g rg-h1b --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 --query "[?properties.active].{replicas:properties.replicas, state:properties.runningState}" -o table
+```
+
+Checking this properly matters, and it is easy to get wrong. Control-plane `az`
+calls do **not** wake the app, but any `curl` to the FQDN does, and the scale
+block's `cooldownPeriod` is 300 s — so a check within five minutes of the last
+request will show a replica still running and prove nothing. Wait out the full
+cooldown with no HTTP requests before drawing a conclusion. An earlier review of
+this project concluded the app "never scales to zero" by sampling too soon and
+by reading a replica that something else had woken; the correct reading is above.
+
+The real consequence of scale-to-zero is a cold start on the first request after
+idle — expected, not a bug.
+
+**Measured 2026-08-14, from a confirmed `ScaledToZero` state:**
+
+```
+cold  HTTP 200 in 24.39 s   (0 replicas -> serving)
+warm  HTTP 200 in  0.06 s   (immediately after)
+```
+
+That sits inside plan §8's predicted 20–30 s, so the prediction holds for the
+placeholder image. Expect the real Streamlit image to be slower — it has a
+heavier runtime to start — so re-measure after Step 10 rather than reusing this
+number.
+
+**Put the figure next to the Azure link**, per §8. A reviewer who waits 25
+seconds on a blank page concludes the app is broken; one who was told to expect
+it concludes the app scales to zero, which is the point being demonstrated.
+
+#### The environment has no log destination
+
+Deliberate. A Log Analytics workspace is billable past 5 GB of ingestion and
+appears nowhere in §7's cost model, so attaching one would breach B3. Live
+streaming still works and needs no workspace:
+
+```bash
+az containerapp logs show -n h1b-web -g rg-h1b --follow --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+What is lost is queryable history — you cannot ask why a container died an hour
+ago. If Step 9's ODBC install proves hard to debug (plan §8 rates that risk
+medium-high), adding a workspace is a small reversible change.
+
+#### Deviation: three required image/port parameters, no defaults
+
+Step 5 specifies `targetPort: 8501` **and** the quickstart placeholder image.
+Those contradict each other — the quickstart image serves on port 80, so with
+8501 nothing accepts a connection, the revision sits in `Activating`
+indefinitely, and requests to the FQDN hang with no response. Observed exactly
+that on the first deploy; **the ARM deployment still reported `Succeeded`.**
+
+The web app and the ETL job also need *separate* images — Step 9 builds from
+`Dockerfile.etl`, Step 10 from `Dockerfile.web` — so a single image parameter
+could not express the required end state at all.
+
+So there are three parameters, and **none has a default**:
+
+```
+webImage       what the Streamlit app runs
+webTargetPort  the port webImage listens on — 80 placeholder, 8501 Streamlit
+etlImage       what the ETL job runs
+```
+
+All three live in `infra/main.parameters.json`. Requiring them is the point: a
+missing parameter fails at validation and names itself —
+
+```
+ERROR: Missing input parameters: webTargetPort
+```
+
+— whereas a plausible default fails *silently at runtime*, which is the failure
+mode above. Step 9 and Step 10 change an image and its port together in the
+parameters file; neither can be swapped while forgetting the other.
+
+> **Do not trigger the ETL job while `etlImage` is the placeholder.** The
+> quickstart image serves HTTP and never exits, so a manual run consumes the
+> full `replicaTimeout` — one hour at 1 vCPU, 3,600 vCPU-seconds, 2% of the
+> monthly free grant, for nothing.
+
+#### `what-if` does not reach zero changes here, and cannot
+
+It reports `12 no change, 1 to modify`. The single modification is
+`properties.runningStatus: "Running"` on `h1b-web`, which is **server-computed
+and not declarable** — confirmed by Bicep rejecting it with
+`BCP037: The property "runningStatus" is not allowed`. Unlike Steps 3 and 4,
+where every phantom diff was fixable by declaring server defaults, this one is
+irreducible. Treat `1 to modify` naming only `runningStatus` as the clean
+baseline for this resource, and investigate anything else.
+
+- [x] Environment provisioned, Consumption-only, no VNet
+- [x] Web app returns **HTTP 200 over HTTPS** at its FQDN — 4,331 bytes of HTML
+- [x] `az containerapp job list` shows `h1b-etl`, Manual, timeout 3600
+- [x] `minReplicas: 0` confirmed **and scale-to-zero observed** — `0 replicas, ScaledToZero` after the cooldown
+- [x] Both managed identities exist with principal IDs recorded above
 - [x] Spend after deployment still `$0.00`
 
 ### Data
