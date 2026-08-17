@@ -121,6 +121,33 @@ def test_upload_rejects_a_directory(tmp_path):
         blob.upload_raw(tmp_path)
 
 
+def test_scratch_paths_are_unique_per_call(tmp_path):
+    """Two concurrent downloads must not agree on one scratch file.
+
+    The process id alone is not enough — threads in one process share it — and
+    ``src.ingest._build`` already carries this scar. If they collide, one
+    thread's rename pulls the file from under the other and the loser's cleanup
+    deletes what the winner is still writing, producing a truncated Parquet that
+    fails much later inside pandas.
+
+    Nothing threads today. Step 9 downloads nine blobs, where a thread pool is
+    the obvious speedup, so this is a guard on a future change rather than on
+    current behaviour.
+    """
+    target = tmp_path / "LCA_Disclosure_Data_FY2024_Q1.parquet"
+    paths = {blob._scratch_path(target) for _ in range(100)}
+    assert len(paths) == 100
+
+
+def test_scratch_path_does_not_collide_with_the_real_file(tmp_path):
+    """It must also not be mistaken for data, or cleaned up as if it were."""
+    target = tmp_path / "LCA_Disclosure_Data_FY2024_Q1.parquet"
+    scratch = blob._scratch_path(target)
+    assert scratch != target
+    assert scratch.name.startswith(target.name)
+    assert scratch.suffix == ".tmp"
+
+
 # --------------------------------------------------------------------------
 # Round trip — needs a real account.
 # --------------------------------------------------------------------------
@@ -212,6 +239,23 @@ def test_raw_holds_exactly_the_nine_dol_caches():
     pointed at the wrong container, a manual experiment.
     """
     names = [name for name, _ in blob.list_raw()]
-    assert len(names) == 9, names
-    assert all(n.startswith("LCA_") and n.endswith(".parquet") for n in names), names
-    assert "LCA_Dislclosure_Data_FY2026_Q2.parquet" in names
+
+    # This assertion has a built-in expiry that is not a code defect.
+    # storage.bicep deletes everything under raw/ after rawRetentionDays (90),
+    # so an empty container roughly 90 days after the last upload is the
+    # retention policy working, not a broken upload. Say so here — otherwise the
+    # failure reads as "someone broke Step 7" and the diagnosis lives only in the
+    # runbook.
+    assert names, (
+        "raw/ is empty. If it has been ~90 days since the last upload this is "
+        "storage.bicep's lifecycle rule doing its job, not a defect — re-run "
+        "'python -m src.etl.blob upload'. If it has not, something deleted them."
+    )
+    assert len(names) == 9, f"expected 9 DOL caches, found {len(names)}: {names}"
+    assert all(
+        n.startswith("LCA_") and n.endswith(".parquet") for n in names
+    ), f"unexpected blob in raw/, which should hold only DOL caches: {names}"
+    assert "LCA_Dislclosure_Data_FY2026_Q2.parquet" in names, (
+        "the misspelled FY2026 cache is missing; a selection matching the "
+        f"correct spelling drops a whole quarter. Found: {names}"
+    )
