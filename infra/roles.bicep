@@ -58,7 +58,8 @@ resource etlBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01'
   // never delete what a template no longer mentions, and Azure does not reap
   // assignments whose principal is gone. They linger as "Identity not found".
   // Nothing is over-granted (principal IDs are never reused) but they
-  // accumulate, so the runbook's teardown checklist has the cleanup command.
+  // accumulate. The cleanup command is in docs/azure-runbook.md §4, under
+  // "Step 6 — Identity grants".
   name: guid(storageAccount.id, etlPrincipalId, storageBlobDataContributorRoleId)
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
@@ -71,5 +72,3 @@ resource etlBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01'
     principalType: 'ServicePrincipal'
   }
 }
-
-output etlRoleAssignmentId string = etlBlobContributor.id

@@ -294,14 +294,43 @@ CREATE USER [h1b-etl] FROM EXTERNAL PROVIDER;
 ALTER ROLE db_datawriter ADD MEMBER [h1b-etl];
 ALTER ROLE db_datareader ADD MEMBER [h1b-etl];
 GRANT CREATE TABLE TO [h1b-etl];
+GRANT CREATE VIEW  TO [h1b-etl];
+GRANT ALTER      ON SCHEMA::dbo TO [h1b-etl];
+GRANT REFERENCES ON SCHEMA::dbo TO [h1b-etl];
 
 CREATE USER [h1b-web] FROM EXTERNAL PROVIDER;
 ALTER ROLE db_datareader ADD MEMBER [h1b-web];
 ```
 
+> **Corrected 2026-08-17.** The last three grants were missing, and without
+> them Step 8 cannot build the schema at all. `GRANT CREATE TABLE` is necessary
+> but not sufficient: creating a table also needs `ALTER` on the target schema,
+> and the failure reads `The specified schema name "dbo" either does not exist
+> or you do not have permission to use it` — which does not name the missing
+> permission and sends you looking for a schema that is plainly there. `ALTER`
+> then does **not** imply `REFERENCES`, and objects created in `dbo` are owned by
+> the schema rather than by their creator, so `h1b-etl` builds `employers` and is
+> refused permission to point `filings`' five foreign keys at it. `CREATE VIEW`
+> is needed for `v_filings`, which §6 defines and this list never granted.
+> All three were found by impersonating the user with `EXECUTE AS`, not by
+> reading documentation.
+
 The web app gets **read-only**. It has no business writing.
 
-**Done when:** `SELECT name, type_desc FROM sys.database_principals WHERE type = 'E'` returns both identities, and the runbook documents that this step is manual and must be repeated if the database is recreated.
+> **Also corrected 2026-08-17: re-run this after recreating the app or the job,
+> not only the database.** The two break access differently. Recreating the
+> database drops the users outright. Recreating the Container App or the ETL job
+> leaves the users in place but replaces the identity behind them — same name,
+> new application ID — so the stored sid points at a principal that no longer
+> exists. Both surface as `Login failed for user '<token-identified principal>'`.
+>
+> This makes name-based guards (`IF NOT EXISTS ... WHERE name = 'h1b-etl'`)
+> actively harmful: they find the name, skip, and leave the broken user in place
+> while reporting success. `sql/grant_identities.sql` therefore drops and
+> recreates both users on every run, inside one transaction, and ends in
+> assertions that `THROW`.
+
+**Done when:** `SELECT name, type_desc FROM sys.database_principals WHERE type = 'E'` returns both identities, `h1b-web` is demonstrably unable to write (verify by impersonation, not by reading the role name), and the runbook documents that this step is manual and must be repeated after recreating **either the database or the apps**.
 
 ---
 
@@ -825,7 +854,7 @@ Every line must read $0.00 or the design is wrong.
 |---|---|---|
 | **Accidental spend** | Medium | Step 2's $1 budget alert exists before any resource. Teardown is one command, documented in Step 12. |
 | **ODBC driver install fails in the container** | Medium-high | Very common and fiddly. Fallback: `pymssql`, which is pip-installable with no system driver — but it does not support Entra token auth cleanly, so you would fall back to SQL authentication and lose the passwordless story. Try `mcr.microsoft.com/mssql-tools` base images before giving up. |
-| **Managed identity to SQL fails** | Medium | The Step 6 grants are manual T-SQL and easy to forget after a DB recreate. Symptom is `Login failed for user '<token-identified principal>'`. Runbook must call this out explicitly. |
+| **Managed identity to SQL fails** | Medium | The Step 6 grants are manual T-SQL and easy to forget after a DB recreate — **or after recreating the app or job**, which silently invalidates the stored sid without removing the user. Symptom for both is `Login failed for user '<token-identified principal>'`. Runbook must call this out explicitly. |
 | **Free-tier DB auto-pauses mid-demo** | Medium | With `AutoPause` exhaustion behavior the DB pauses if the monthly grant runs out; a 60-second resume delay looks broken to a recruiter. Mitigate by keeping `autoPauseDelay` at 60 min, and put "first load may take ~60s" next to the Azure link. |
 | **Cold start makes the demo look slow** | High | Scale-to-zero means the first request wakes a replica. Expected, not a bug. Note it beside the link, and keep the Streamlit Cloud version as the primary demo link if it matters. |
 | **Bicep learning curve stalls Phase B** | Medium | Bicep is the least familiar piece here. Fallback: `az cli` scripts in `infra/deploy.sh` — less impressive, still reproducible, and can be converted to Bicep later. |
