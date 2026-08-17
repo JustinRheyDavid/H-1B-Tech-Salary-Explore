@@ -9,6 +9,7 @@
 //   Step 3  storage.bicep
 //   Step 4  sql.bicep
 //   Step 5  containerapps.bicep
+//   Step 6  roles.bicep          <- blob role assignment (the SQL half is manual)
 //
 // Deploy:
 //   az deployment group create -g rg-h1b --template-file infra/main.bicep \
@@ -112,6 +113,20 @@ module containerapps 'containerapps.bicep' = {
     webImage: webImage
     webTargetPort: webTargetPort
     etlImage: etlImage
+  }
+}
+
+// Depends on both modules above: the storage account to scope the assignment to,
+// and the ETL job's identity to assign it to. Bicep infers the ordering from the
+// output references, so no explicit dependsOn is needed.
+//
+// Covers only the storage half of Step 6. The Azure SQL grants cannot be
+// expressed in ARM — see roles.bicep and sql/grant_identities.sql.
+module roles 'roles.bicep' = {
+  name: 'roles'
+  params: {
+    storageAccountName: storage.outputs.storageAccountName
+    etlPrincipalId: containerapps.outputs.etlPrincipalId
   }
 }
 
