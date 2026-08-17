@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from uuid import uuid4
 
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient, ContainerClient
@@ -170,6 +171,27 @@ def upload_raw(
     return path.name
 
 
+def _scratch_path(target: Path) -> Path:
+    """A scratch name for ``target`` that is unique per call.
+
+    The uuid is not decoration, and this function exists so that is testable.
+    ``src.ingest._build`` learned the same lesson first and says so in its own
+    comment: **the process id alone is not enough, because threads in one process
+    share it.** Two concurrent downloads of the same blob to the same destination
+    would otherwise agree on one scratch path, and then
+
+    * one thread's ``tmp.replace(target)`` pulls the file out from under the
+      other, and
+    * the loser's ``finally: tmp.unlink()`` deletes a file the winner is still
+      writing.
+
+    The result is a truncated or missing Parquet file that fails later, in
+    pandas, pointing nowhere near here. Nothing threads today — but Step 9
+    downloads nine blobs, and a thread pool there is the obvious speedup.
+    """
+    return target.with_suffix(f"{target.suffix}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+
+
 def download_raw(
     blob_name: str, dest: Path | str, *, container: str = RAW_CONTAINER
 ) -> Path:
@@ -187,7 +209,7 @@ def download_raw(
     target = dest / blob_name if dest.is_dir() else dest
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    tmp = target.with_suffix(f"{target.suffix}.{os.getpid()}.tmp")
+    tmp = _scratch_path(target)
     client = container_client(container)
     try:
         with tmp.open("wb") as handle:
