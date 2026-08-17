@@ -10,5 +10,12 @@ pyarrow==24.0.0          # Parquet cache; raw .xlsx are far too slow to re-read
 streamlit==1.61.1
 plotly==6.9.0
 
+# Azure (Phase 2 only). Nothing in the Phase 1 pipeline or app.py imports
+# these; src/etl/ is the only consumer, and tests/test_blob.py skips itself if
+# they are absent. Entra auth only — allowSharedKeyAccess is false on the
+# storage account, so there is no account key for a connection string to carry.
+azure-storage-blob==12.30.0
+azure-identity==1.25.3
+
 # Testing
 pytest==9.1.1

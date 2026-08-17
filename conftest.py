@@ -17,3 +17,9 @@ def pytest_configure(config):
         'automatically when absent; run "pytest -m \'not slow\'" to skip it '
         "even when present.",
     )
+    config.addinivalue_line(
+        "markers",
+        "azure: talks to the real storage account. Skipped automatically when "
+        "the SDK is missing, nobody is logged in, or the container is "
+        "unreachable, so a clone with no Azure account still runs green.",
+    )
