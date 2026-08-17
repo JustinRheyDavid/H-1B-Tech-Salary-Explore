@@ -634,9 +634,23 @@ this project concluded the app "never scales to zero" by sampling too soon and
 by reading a replica that something else had woken; the correct reading is above.
 
 The real consequence of scale-to-zero is a cold start on the first request after
-idle — expected, not a bug. Plan §8 puts it at 20–30 seconds. **That figure is
-inherited from the plan and has not been measured here** — the only timings taken
-were warm (~0.07 s).
+idle — expected, not a bug.
+
+**Measured 2026-08-14, from a confirmed `ScaledToZero` state:**
+
+```
+cold  HTTP 200 in 24.39 s   (0 replicas -> serving)
+warm  HTTP 200 in  0.06 s   (immediately after)
+```
+
+That sits inside plan §8's predicted 20–30 s, so the prediction holds for the
+placeholder image. Expect the real Streamlit image to be slower — it has a
+heavier runtime to start — so re-measure after Step 10 rather than reusing this
+number.
+
+**Put the figure next to the Azure link**, per §8. A reviewer who waits 25
+seconds on a blank page concludes the app is broken; one who was told to expect
+it concludes the app scales to zero, which is the point being demonstrated.
 
 #### The environment has no log destination
 
