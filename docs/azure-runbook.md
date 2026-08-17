@@ -604,6 +604,10 @@ h1b-etl  7cb7a8f0-0417-402c-8971-ee3ca66137a2   (SystemAssigned, gets db_datawri
 > These change if the app or job is deleted and recreated. Re-read them with
 > `az containerapp show -n h1b-web -g rg-h1b --query identity.principalId -o tsv`
 > before running Step 6's grants.
+>
+> These are **object IDs**, which is what Azure RBAC wants. Azure SQL wants the
+> **application ID** instead — a different GUID for the same identity. Both are
+> tabulated in Step 6 below; do not use one where the other belongs.
 
 #### `minReplicas: 0` is the whole cost story — and it demonstrably works
 
@@ -719,6 +723,215 @@ baseline for this resource, and investigate anything else.
 - [x] Both managed identities exist with principal IDs recorded above
 - [x] Spend after deployment still `$0.00`
 
+### Step 6 — Identity grants, DONE 2026-08-17
+
+Two grant paths that work nothing like each other:
+
+| | Where it lives | Redeployed by |
+|---|---|---|
+| Blob access for `h1b-etl` | `infra/roles.bicep` | `az deployment group create` |
+| Database users for both | `sql/grant_identities.sql` | **a human, by hand** |
+
+#### The SQL half is manual, and this is the part that gets forgotten
+
+Database users live inside the database, not in ARM. Nothing in Bicep creates
+them, and nothing in Bicep notices they are missing.
+
+**Re-run `sql/grant_identities.sql` after a database recreate — and after
+recreating the Container App or the ETL job.** Two different breakages, one
+symptom (`Login failed for user '<token-identified principal>'`):
+
+| What you recreated | What happens to the users | Why it is easy to miss |
+|---|---|---|
+| the database | they are dropped with it | `what-if` reports `no change`; ARM never knew they existed |
+| the app or the job | they survive, pointing at a dead identity | the name is unchanged — only the application ID behind it moved |
+
+```bash
+sqlcmd -b -S sql-h1b-hutymqa65yoty.database.windows.net -d sqldb-h1b --authentication-method ActiveDirectoryAzCli -i sql/grant_identities.sql
+```
+
+`ActiveDirectoryAzCli` reuses the `az login` token, so it needs no password —
+which is the point, since the server is `azureADOnlyAuthentication` and no
+password exists.
+
+**The `-b` is not optional.** Without it `sqlcmd` prints errors and still exits
+`0`. Verified: a script whose `CREATE USER` failed and whose every subsequent
+grant failed with it exited `0` and was, to the shell, indistinguishable from a
+clean run. With `-b` the same script exits `1`.
+
+The script **converges rather than skipping work** — it drops and recreates both
+users on every run, so it ends in the correct state regardless of the state it
+started in, and the whole thing is one transaction so a failed run changes
+nothing. It ends in assertions that `THROW`, not in output for a human to read.
+
+Verified end to end:
+
+```
+clean run                              exit 0
+h1b-etl corrupted with a stale sid ->  sid repaired to 0xEA8B9706...  exit 0
+REFERENCES revoked, assertions run ->  exit 1
+h1b-web given db_datawriter        ->  "h1b-web HAS WRITE ACCESS — it must be read-only"
+re-run to repair                       exit 0, assertions pass
+```
+
+The earlier version of this script guarded with
+`IF NOT EXISTS (... WHERE name = 'h1b-etl')` and was subtly useless: a name check
+cannot see a stale sid. In the recreated-app case it found the name, skipped, and
+left the broken user in place while reporting success — so the recovery procedure
+documented here would have done nothing at all.
+
+What each identity got, and deliberately did not:
+
+```
+h1b-etl   db_datareader, db_datawriter
+          CREATE TABLE, CREATE VIEW
+          ALTER ON SCHEMA::dbo, REFERENCES ON SCHEMA::dbo
+h1b-web   db_datareader                       <- read-only, nothing else
+```
+
+Read-only for the dashboard was **verified by impersonation, not assumed** from
+the role name:
+
+```
+h1b-web SELECT : OK (expected)
+h1b-web INSERT : DENIED -> The INSERT permission was denied on the object ...
+h1b-web CREATE : DENIED -> CREATE TABLE permission denied in database ...
+```
+
+#### Deviation: the plan's grants do not let the ETL create the schema
+
+Plan Step 6 lists `GRANT CREATE TABLE TO [h1b-etl]` and nothing else. That is
+necessary but not sufficient, and both gaps were found by impersonating the user
+rather than by reading documentation:
+
+1. **`ALTER ON SCHEMA::dbo`.** Creating a table needs CREATE TABLE on the
+   database *and* ALTER on the schema it lands in. Without it Step 8 fails on its
+   first statement with `The specified schema name "dbo" either does not exist or
+   you do not have permission to use it` — which is a misleading way to report a
+   missing permission, since `dbo` obviously exists.
+2. **`REFERENCES ON SCHEMA::dbo`.** ALTER does not imply it. Objects created in
+   `dbo` are owned by the schema, not by the identity that created them, so
+   `h1b-etl` creates `employers` and is then refused permission to point a
+   foreign key at it — `The REFERENCES permission was denied on the object`, on a
+   table it had created one statement earlier. `filings` declares five such keys.
+
+With both added, an impersonated `h1b-etl` successfully ran CREATE TABLE, CREATE
+TABLE with a foreign key, CREATE INDEX with an INCLUDE list, CREATE VIEW, INSERT,
+and SELECT through the view. All of it inside a rolled-back transaction — the
+database is still empty, `sys.tables` returns nothing, and Step 8 remains the
+step that creates the schema.
+
+#### The sid in SQL is the application ID, not the principal ID
+
+A managed identity has two GUIDs and this step touches both:
+
+```
+                object / principal ID                 application (client) ID
+h1b-web   b16f09c9-0791-487c-8801-baa35d3435bd   b497d91d-7081-4861-9ffb-22d868f31b45
+h1b-etl   7cb7a8f0-0417-402c-8971-ee3ca66137a2   06978bea-22bb-416b-8ce6-3cd1c212e0f0
+```
+
+**Azure RBAC uses the object ID; Azure SQL uses the application ID.** So
+`infra/roles.bicep` assigns to `7cb7a8f0…` while `sys.database_principals` stores
+the sid `0xEA8B9706BB226B418CE63CD1C212E0F0`, which is `06978bea…` byte-swapped.
+
+`CREATE USER … FROM EXTERNAL PROVIDER` gets this right on its own — it worked
+here without the server needing a managed identity of its own. The trap is only
+in the explicit `WITH SID` fallback: a user created from the *object* ID is
+created successfully, looks correct in `sys.database_principals`, and can never
+log in, because the token the identity presents carries the application ID.
+
+Re-read both, for either identity, with:
+
+```bash
+az ad sp list --display-name h1b-etl --query "[].{objectId:id, appId:appId}" -o table
+```
+
+#### `what-if` cannot see the role assignment
+
+It reports `1 unsupported` alongside the usual `1 to modify` for
+`runningStatus`:
+
+```
+(Unsupported) Changes to the resource ... cannot be analyzed because its
+resource ID ... cannot be calculated until the deployment is under way.
+```
+
+Expected, not a defect. The assignment's name is `guid()` of a `reference()` to
+the ETL job's principal ID, which does not exist until deployment runs. **So
+`what-if` is not evidence about this resource** — check it directly instead:
+
+```bash
+az role assignment list --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/Microsoft.Storage/storageAccounts/sth1bhutymqa65yoty --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 -o table
+```
+
+Deployed twice; still exactly one assignment, because the name is derived from
+(scope, principal, role) and is therefore stable.
+
+**Recreating the ETL job orphans the old assignment.** A new principal ID means a
+new assignment name, so the next deployment creates a second one and leaves the
+first — ARM incremental never deletes what a template stopped mentioning, and
+Azure does not reap assignments whose principal is gone. Nothing is over-granted,
+since principal IDs are never reused, but they accumulate and a security review
+will ask about them. Not observed here (confirming it means deleting the job);
+reasoned from ARM's documented incremental-mode behaviour. Check and clean up:
+
+```bash
+az role assignment list --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/Microsoft.Storage/storageAccounts/sth1bhutymqa65yoty --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 --query "[].{principal:principalId, role:roleDefinitionName, name:name}" -o table
+```
+
+Any row whose `principal` is not the current `h1b-etl` principal ID is an orphan;
+remove it with `az role assignment delete --ids <the assignment id>`.
+
+#### The database was paused, and that is working as designed
+
+The first connection failed outright:
+
+```
+Database 'sqldb-h1b' ... is not currently available. Please retry the connection later.
+```
+
+`az sql db show` reported `status: Resuming` and a `pausedDate` three days
+earlier. It was `Online` on the next check. This is `autoPauseDelay: 60` doing
+its job and is the mechanism that keeps idle cost at zero — not an error to
+debug. Retry after waiting. The exact resume duration was not measured here;
+plan §8 budgets ~60 seconds.
+
+> **Carry this into Step 9.** The ETL job has `replicaRetryLimit: 1`. If it
+> triggers against a paused database the first connection fails outright, and
+> whether the single retry lands after the resume finishes is unknown — untested,
+> because the resume was not timed. If it does not, the job fails for reasons
+> that have nothing to do with the load. Either widen the retry budget or open a
+> warm-up connection before the real work, and decide that at Step 9 rather than
+> discovering it there.
+
+#### What this step does NOT cover
+
+**Step 7 will hit a wall.** Uploading raw data to Blob needs
+`Storage Blob Data Contributor` for *you*, and you do not have it. Subscription
+Owner is control-plane only — it lets you delete the storage account but not read
+a blob in it — and `allowSharedKeyAccess: false` removes the account-key
+fallback. The symptom is `AuthorizationPermissionMismatch`. It is deliberately
+not in `roles.bicep`, which grants managed identities, not people:
+
+```bash
+az role assignment create --assignee 8ff2eb8b-1fe8-4bb1-9e8f-1a434ee951a8 --role "Storage Blob Data Contributor" --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/Microsoft.Storage/storageAccounts/sth1bhutymqa65yoty
+```
+
+Neither identity's SQL access has been proven from the workload itself. The
+grants are verified by impersonation from an admin session; an actual
+managed-identity login is first exercised at Step 9, when `h1b-etl` runs a real
+image. Impersonation tests the permissions, not the token path.
+
+- [x] `SELECT name, type_desc FROM sys.database_principals WHERE type = 'E'` returns both identities
+- [x] Roles and permissions confirmed per identity; `h1b-web` write attempts denied
+- [x] `Storage Blob Data Contributor` on the storage account for `h1b-etl` only
+- [x] Role assignment idempotent — deployed twice, one assignment
+- [x] Grant script converges — repaired a deliberately corrupted sid, and restored `h1b-web` to read-only after it was given write access
+- [x] Grant script fails loudly — assertions `THROW`, and `sqlcmd -b` exits non-zero on drift
+- [x] Runbook records that the SQL half is manual and must be repeated after a database recreate
+- [x] Spend after deployment still `$0.00`
+
 ### Data
 
 <!-- Step 7 onward. Not written yet. -->
@@ -737,6 +950,23 @@ baseline for this resource, and investigate anything else.
 The managed identity has not been granted access to Azure SQL. The Step 6 grants
 are manual T-SQL and are easy to forget after recreating the database. Re-run
 `sql/grant_identities.sql` as the Entra admin.
+
+### `The specified schema name "dbo" either does not exist or you do not have permission to use it`
+
+Hit while probing Step 6's grants. The schema does exist; the message means the
+identity lacks `ALTER ON SCHEMA::dbo`, which creating a table requires in
+addition to `CREATE TABLE`. Its sibling is `The REFERENCES permission was denied
+on the object …` when creating a foreign key, which needs
+`REFERENCES ON SCHEMA::dbo`. Both grants are in `sql/grant_identities.sql`; if
+you see either, the script has not been run against this database.
+
+### `Database 'sqldb-h1b' ... is not currently available`
+
+Not a fault. The database is serverless with `autoPauseDelay: 60`, so it pauses
+after an hour idle and the next connection fails while it resumes. Check with
+`az sql db show -n sqldb-h1b -s sql-h1b-hutymqa65yoty -g rg-h1b --query status`;
+`Resuming` means wait and retry. This is the behaviour that keeps idle cost at
+zero — see Step 6.
 
 ### Titles load rejects rows / `titles` count is not 123,990
 
