@@ -3,7 +3,7 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–5 done. Every value below was read from a live `az` command
+**Status:** Steps 1–6 done. Every value below was read from a live `az` command
 or a real SQL connection rather than transcribed. The data path (Step 7 onward)
 and teardown are still `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real
 blank, not a placeholder for something already known.
@@ -907,16 +907,8 @@ plan §8 budgets ~60 seconds.
 
 #### What this step does NOT cover
 
-**Step 7 will hit a wall.** Uploading raw data to Blob needs
-`Storage Blob Data Contributor` for *you*, and you do not have it. Subscription
-Owner is control-plane only — it lets you delete the storage account but not read
-a blob in it — and `allowSharedKeyAccess: false` removes the account-key
-fallback. The symptom is `AuthorizationPermissionMismatch`. It is deliberately
-not in `roles.bicep`, which grants managed identities, not people:
-
-```bash
-az role assignment create --assignee 8ff2eb8b-1fe8-4bb1-9e8f-1a434ee951a8 --role "Storage Blob Data Contributor" --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/Microsoft.Storage/storageAccounts/sth1bhutymqa65yoty
-```
+**The operator needs a blob grant too — granted 2026-08-17, see below.** It is
+deliberately not in `roles.bicep`, which grants managed identities, not people.
 
 Neither identity's SQL access has been proven from the workload itself. The
 grants are verified by impersonation from an admin session; an actual
@@ -931,6 +923,58 @@ image. Impersonation tests the permissions, not the token path.
 - [x] Grant script fails loudly — assertions `THROW`, and `sqlcmd -b` exits non-zero on drift
 - [x] Runbook records that the SQL half is manual and must be repeated after a database recreate
 - [x] Spend after deployment still `$0.00`
+
+### Step 7 prerequisite — operator blob access, DONE 2026-08-17
+
+Step 6 grants the *machines*. This grants the *person*, and without it Step 7
+cannot upload a single byte.
+
+**Subscription Owner does not let you read a blob.** Owner is a control-plane
+role: it lets you delete the whole storage account but not list what is inside
+it. `allowSharedKeyAccess: false` (Step 3) removes the account-key fallback that
+would otherwise paper over this. Verified before granting anything — as Owner:
+
+```
+ERROR:
+You do not have the required permissions needed to perform this operation.
+Depending on your operation, you may need to be assigned one of the following roles:
+    "Storage Blob Data Owner"
+    "Storage Blob Data Contributor"
+    "Storage Blob Data Reader"
+```
+
+The fix, scoped to the storage account rather than the subscription:
+
+```bash
+az role assignment create --assignee 8ff2eb8b-1fe8-4bb1-9e8f-1a434ee951a8 --role "Storage Blob Data Contributor" --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/Microsoft.Storage/storageAccounts/sth1bhutymqa65yoty --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+Confirmed working afterwards — note `--auth-mode login`, which forces the data
+plane to use your Entra token instead of looking for an account key that does not
+exist:
+
+```bash
+az storage container list --account-name sth1bhutymqa65yoty --auth-mode login --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 --query "[].name" -o tsv
+```
+
+```
+curated
+raw
+```
+
+> **This grant is manual and per-person, like the SQL grants and for the same
+> reason.** It is not in `roles.bicep` — that file grants managed identities, and
+> a human's object ID does not belong in infrastructure code that a second
+> contributor would also deploy. Consequences to remember:
+>
+> - **Recreating the storage account drops it.** The account name is seeded with
+>   `uniqueString(resourceGroup().id, location)`, so it survives a normal
+>   redeploy — but a teardown and rebuild means re-running the command above.
+> - **Anyone else working on this needs their own.** Substitute their object ID
+>   from `az ad signed-in-user show --query id -o tsv`.
+> - **Symptom if it is missing:** `AuthorizationPermissionMismatch`, or the
+>   permissions error quoted above. It does not mean the storage account is
+>   misconfigured.
 
 ### Data
 
