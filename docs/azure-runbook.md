@@ -737,20 +737,48 @@ Two grant paths that work nothing like each other:
 Database users live inside the database, not in ARM. Nothing in Bicep creates
 them, and nothing in Bicep notices they are missing.
 
-**Re-run `sql/grant_identities.sql` after any database recreate.** Drop and
-redeploy `sqldb-h1b` and its users go with it, while
-`az deployment group what-if` cheerfully reports `no change` — ARM has no idea
-those users ever existed. The first symptom is the ETL job dying with
-`Login failed for user '<token-identified principal>'`.
+**Re-run `sql/grant_identities.sql` after a database recreate — and after
+recreating the Container App or the ETL job.** Two different breakages, one
+symptom (`Login failed for user '<token-identified principal>'`):
+
+| What you recreated | What happens to the users | Why it is easy to miss |
+|---|---|---|
+| the database | they are dropped with it | `what-if` reports `no change`; ARM never knew they existed |
+| the app or the job | they survive, pointing at a dead identity | the name is unchanged — only the application ID behind it moved |
 
 ```bash
-sqlcmd -S sql-h1b-hutymqa65yoty.database.windows.net -d sqldb-h1b --authentication-method ActiveDirectoryAzCli -i sql/grant_identities.sql
+sqlcmd -b -S sql-h1b-hutymqa65yoty.database.windows.net -d sqldb-h1b --authentication-method ActiveDirectoryAzCli -i sql/grant_identities.sql
 ```
 
 `ActiveDirectoryAzCli` reuses the `az login` token, so it needs no password —
 which is the point, since the server is `azureADOnlyAuthentication` and no
-password exists. The script is guarded throughout and safe to run repeatedly;
-verified by running it twice.
+password exists.
+
+**The `-b` is not optional.** Without it `sqlcmd` prints errors and still exits
+`0`. Verified: a script whose `CREATE USER` failed and whose every subsequent
+grant failed with it exited `0` and was, to the shell, indistinguishable from a
+clean run. With `-b` the same script exits `1`.
+
+The script **converges rather than skipping work** — it drops and recreates both
+users on every run, so it ends in the correct state regardless of the state it
+started in, and the whole thing is one transaction so a failed run changes
+nothing. It ends in assertions that `THROW`, not in output for a human to read.
+
+Verified end to end:
+
+```
+clean run                              exit 0
+h1b-etl corrupted with a stale sid ->  sid repaired to 0xEA8B9706...  exit 0
+REFERENCES revoked, assertions run ->  exit 1
+h1b-web given db_datawriter        ->  "h1b-web HAS WRITE ACCESS — it must be read-only"
+re-run to repair                       exit 0, assertions pass
+```
+
+The earlier version of this script guarded with
+`IF NOT EXISTS (... WHERE name = 'h1b-etl')` and was subtly useless: a name check
+cannot see a stale sid. In the recreated-app case it found the name, skipped, and
+left the broken user in place while reporting success — so the recovery procedure
+documented here would have done nothing at all.
 
 What each identity got, and deliberately did not:
 
@@ -840,6 +868,21 @@ az role assignment list --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378f
 Deployed twice; still exactly one assignment, because the name is derived from
 (scope, principal, role) and is therefore stable.
 
+**Recreating the ETL job orphans the old assignment.** A new principal ID means a
+new assignment name, so the next deployment creates a second one and leaves the
+first — ARM incremental never deletes what a template stopped mentioning, and
+Azure does not reap assignments whose principal is gone. Nothing is over-granted,
+since principal IDs are never reused, but they accumulate and a security review
+will ask about them. Not observed here (confirming it means deleting the job);
+reasoned from ARM's documented incremental-mode behaviour. Check and clean up:
+
+```bash
+az role assignment list --scope /subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b/providers/Microsoft.Storage/storageAccounts/sth1bhutymqa65yoty --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 --query "[].{principal:principalId, role:roleDefinitionName, name:name}" -o table
+```
+
+Any row whose `principal` is not the current `h1b-etl` principal ID is an orphan;
+remove it with `az role assignment delete --ids <the assignment id>`.
+
 #### The database was paused, and that is working as designed
 
 The first connection failed outright:
@@ -853,6 +896,14 @@ earlier. It was `Online` on the next check. This is `autoPauseDelay: 60` doing
 its job and is the mechanism that keeps idle cost at zero — not an error to
 debug. Retry after waiting. The exact resume duration was not measured here;
 plan §8 budgets ~60 seconds.
+
+> **Carry this into Step 9.** The ETL job has `replicaRetryLimit: 1`. If it
+> triggers against a paused database the first connection fails outright, and
+> whether the single retry lands after the resume finishes is unknown — untested,
+> because the resume was not timed. If it does not, the job fails for reasons
+> that have nothing to do with the load. Either widen the retry budget or open a
+> warm-up connection before the real work, and decide that at Step 9 rather than
+> discovering it there.
 
 #### What this step does NOT cover
 
@@ -876,7 +927,8 @@ image. Impersonation tests the permissions, not the token path.
 - [x] Roles and permissions confirmed per identity; `h1b-web` write attempts denied
 - [x] `Storage Blob Data Contributor` on the storage account for `h1b-etl` only
 - [x] Role assignment idempotent — deployed twice, one assignment
-- [x] Grant script re-runnable — run twice, no errors
+- [x] Grant script converges — repaired a deliberately corrupted sid, and restored `h1b-web` to read-only after it was given write access
+- [x] Grant script fails loudly — assertions `THROW`, and `sqlcmd -b` exits non-zero on drift
 - [x] Runbook records that the SQL half is manual and must be repeated after a database recreate
 - [x] Spend after deployment still `$0.00`
 

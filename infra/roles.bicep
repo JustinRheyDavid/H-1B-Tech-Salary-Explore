@@ -51,6 +51,14 @@ resource etlBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01'
   // idempotent: the same three inputs always produce the same name, so a second
   // deployment updates the existing assignment instead of failing with
   // RoleAssignmentExists or piling up duplicates.
+  //
+  // The flip side: if the ETL job is deleted and recreated it gets a NEW
+  // principal ID, so this name changes, so the next deployment creates a SECOND
+  // assignment and leaves the first one behind — ARM incremental deployments
+  // never delete what a template no longer mentions, and Azure does not reap
+  // assignments whose principal is gone. They linger as "Identity not found".
+  // Nothing is over-granted (principal IDs are never reused) but they
+  // accumulate, so the runbook's teardown checklist has the cleanup command.
   name: guid(storageAccount.id, etlPrincipalId, storageBlobDataContributorRoleId)
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
