@@ -620,6 +620,17 @@ show no collisions under either rule because `clean.py` normalizes them; they
 get `BIN2` anyway, so that a future normalization change cannot quietly start
 merging rows.
 
+> **Verified 2026-08-17, and the answer is no.** `BIN2` keeps case, trailing
+> tabs and leading spaces distinct — but **merges trailing spaces**, because SQL
+> Server pads both operands to equal length before comparing and no collation
+> exempts that. It cuts collisions from 9,286 to 2,773; those 2,773 are still
+> refused by a plain `UNIQUE`, taking 44,045 filings with them. The fix shipped
+> in `sql/schema_azure.sql` is a persisted computed column
+> `key_exact AS (job_title + N'.')` carrying the `UNIQUE`, which turns a
+> trailing space into an interior one. All 123,990 titles then load, and a true
+> duplicate is still refused. The check below is kept for the distinctions BIN2
+> *does* preserve.
+
 **Verify `BIN2` before Step 9 depends on it.** That a binary collation makes
 *case* significant is documented. That it also makes *trailing spaces*
 significant is the half this plan could not confirm from Microsoft's

@@ -3,9 +3,9 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–7 done. Every value below was read from a live `az` command
+**Status:** Steps 1–8 done. Every value below was read from a live `az` command
 or a real SQL connection rather than transcribed. The rest of the data path
-(Step 8 onward) and teardown are still `<TO BE WRITTEN>`; any remaining
+(Step 9 onward) and teardown are still `<TO BE WRITTEN>`; any remaining
 `<FILL IN>` is a real blank, not a placeholder for something already known.
 
 The build plan this follows is [`docs/plans/azure-migration.md`](plans/azure-migration.md).
@@ -1098,7 +1098,185 @@ or no network.
 - [x] `download_raw` round-trips SHA-256-identical and the file parses as Parquet
 - [x] Upload is resumable — verified by an interrupted run that skipped what it had already done
 - [x] 243 tests pass
-- [ ] Spend re-checked 2026-08-18 — **pending, see above**
+- [x] Spend re-checked 2026-08-18 — **0.00010934228 CAD**, see below
+
+> **The re-check mattered.** Read minutes after the upload, spend was `$0.00`.
+> Read a day later, with the consumption pipeline caught up, it is
+> `0.00010934228 CAD` — a hundredth of a cent, and **not zero**. Banking the
+> same-day reading would have recorded a false confirmation.
+>
+> Nothing is wrong: 175 MB of Hot LRS is fractions of a cent a month and the
+> $1.00 budget will never fire. But the project's headline claim is more
+> honestly stated as **"under a cent a month"** than as "$0.00" now that there
+> is a byte at rest. Storage is the only line item; compute is still genuinely
+> free while the app scales to zero and the database sits on the free offer.
+
+
+### Step 8 — T-SQL schema and the dialect split, DONE 2026-08-18
+
+```
+SCHEMA   = sql/schema_azure.sql   6 tables, 3 indexes, 1 view
+BACKENDS = src/db/{base,sqlite_impl,azure_impl}.py, selected by DB_BACKEND
+TESTS    = tests/test_db.py       21 offline, 16 against the live database
+```
+
+#### BIN2 is not sufficient, and the plan said to stop here
+
+Plan §6 asks for the collation to be proven before Step 9 depends on it, and
+predicted `BIN2` would settle it. **It does not.** Measured on this database, one
+distinction at a time:
+
+| distinction | under `Latin1_General_BIN2` |
+|---|---|
+| case | kept |
+| trailing tab | kept |
+| leading space | kept |
+| **trailing space** | **MERGED** |
+
+`BIN2` compares byte by byte, but SQL Server pads both operands to equal length
+*before* comparing, and no collation exempts that. `DATALENGTH` reports 26 bytes
+against 28 while `=` still says equal.
+
+The consequence, measured against `data/h1b.db`: `BIN2` cuts title collisions
+from 9,286 to **2,773** — but a plain `UNIQUE` still refuses those 2,773, and
+**44,045 filings (5.2% of the data) point at them**. The worst groups are the
+most common titles in the dataset:
+
+```
+'Software Engineer'  'Software Engineer '  'Software Engineer  '  'Software Engineer        '
+'Data Engineer'      'Data Engineer '      'Data Engineer   '     'Data Engineer      '
+```
+
+#### The fix: a sentinel computed column
+
+```sql
+job_title NVARCHAR(100) COLLATE Latin1_General_BIN2 NOT NULL,
+key_exact AS (job_title + N'.') PERSISTED,
+CONSTRAINT uq_titles_job_title UNIQUE (key_exact)
+```
+
+Appending a sentinel makes a trailing space an *interior* space, and interior
+spaces were never padding. Chosen over the two alternatives because it keeps
+both properties: all 123,990 titles load **and** a true duplicate is still
+refused. Dropping `UNIQUE` would have given up the second; normalizing
+whitespace in the loader would have changed what users search on and the
+per-title counts the README quotes.
+
+**Verified at full scale, not on a fixture:** all 123,990 real titles loaded with
+no rejections.
+
+Moving `UNIQUE` off `job_title` also removed the index Phase 1 got for free from
+it, so `idx_titles_job_title` is declared explicitly. Note it cannot serve
+`title_search` as a *seek* regardless — the column is `BIN2`, the `LIKE` applies
+`Latin1_General_CI_AS`, and a collation mismatch forces a scan.
+
+#### `PERCENTILE_CONT` does match Phase 1's hand-rolled interpolation
+
+The claim the whole port rests on, and the one the plan said could not be checked
+from a laptop. Both expressions were run over the same rows **inside Azure** and
+agree to 1e-6. So the two backends can be compared for equality rather than for
+shape — which is what `tests/test_db.py` does.
+
+#### Dialect surprises beyond the four the plan predicted
+
+The plan named four queries that would not parse. All four did break, and all
+four were fixed as described. One extra was not predicted:
+
+**A repeated parameterised expression does not satisfy `GROUP BY`.** The obvious
+port of `wage_distribution` repeats the `CAST` in `GROUP BY`, which is what the
+plan advises, and fails:
+
+```
+Column 'filings.annual_wage' is invalid in the select list because it is not
+contained in either an aggregate function or the GROUP BY clause. (8120)
+```
+
+The two expressions are textually identical, but each `?` is a distinct parameter
+marker and the optimizer does not treat them as the same expression. Computing
+the bin once in a CTE sidesteps it and binds the width twice instead of four
+times.
+
+#### Local setup: the ODBC driver is not pip-installable
+
+`pyodbc` needs Microsoft's ODBC Driver 18 present on the machine. On macOS
+Homebrew now refuses the Microsoft tap without an explicit trust grant:
+
+```bash
+brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release
+```
+
+```bash
+brew trust microsoft/mssql-release
+```
+
+```bash
+HOMEBREW_ACCEPT_EULA=Y brew install msodbcsql18
+```
+
+Step 9's container installs it in the Dockerfile instead; nothing about the
+deployed path depends on a developer machine having it. `tests/test_db.py` skips
+its Azure tests when it is absent.
+
+#### Current data state — partial, on purpose
+
+The five lookup tables are loaded **in full** (43,573 employers, 63 occupations,
+123,990 titles, 8,570 locations, 4 visa classes) because the titles constraint is
+the thing that changed and 123,990 rows is the only honest test of it. `filings`
+holds only the 70,949 rows for `Software Engineer` — enough for the equality
+tests, and loading all 850,321 is Step 9's job.
+
+**Step 9's loader must therefore be write-idempotent** — delete-then-load, or
+merge — rather than assuming empty tables.
+
+#### Verification
+
+```
+22 offline tests   Protocol shape (both backends), backend selection, adapter
+                   transparency
+16 live tests      all seven functions, both backends, same rows, equal output
+283 total          full suite, both markers
+```
+
+The equality tests are **read-only against Azure**: they mirror whatever the
+database currently holds into a temporary SQLite file and ask both backends the
+same questions. Nothing seeds or truncates the real tables, so they stay safe to
+run after Step 9 loads 850,321 rows.
+
+### `REQUIRE_AZURE=1` — for CI, and only for CI
+
+The 16 live tests **skip** when the ODBC driver is missing, nobody is logged in,
+or the database is unreachable, so a clone with no Azure account still runs
+green. That is right for a contributor and wrong for the one CI job whose whole
+purpose is to exercise Azure: a paused database or an expired federated
+credential would report success while testing nothing.
+
+```bash
+REQUIRE_AZURE=1 pytest -m azure
+```
+
+turns every one of those skips into a failure. Verified both ways against an
+unreachable server: unset gives `16 skipped` and exit 0; set gives `16 errors`
+and exit 1.
+
+**Decision for Step 11:** CI runs the suite twice — once without the flag (the
+contributor's path, Azure optional) and once with `REQUIRE_AZURE=1` on the job
+that holds the OIDC credentials. A green badge on a public repo should not be
+able to mean "everything skipped".
+
+Two divergences are asserted as acceptable rather than fixed:
+
+- **`title_search` capitalisation.** SQLite picks an arbitrary member of each
+  `lower(job_title)` group; T-SQL forbids a bare column there and the port uses
+  `MIN`. Compared case-folded — either spelling finds the same filings.
+- **Ties at `top_employers`' cutoff.** `TOP (n)` and `LIMIT n` both break a tie
+  arbitrarily, so the two can pick different employers when the nth and n+1th are
+  tied.
+
+- [x] Phase 1 suite passes unchanged — no test edited, and its count only grew
+- [x] All seven functions agree between backends, exactly
+- [x] `PERCENTILE_CONT` confirmed equal to Phase 1's interpolation
+- [x] 123,990 titles load with no rejections
+- [x] Schema script is re-runnable and asserts its own invariants
 
 ---
 

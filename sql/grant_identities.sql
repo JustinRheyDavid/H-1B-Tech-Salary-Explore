@@ -73,7 +73,7 @@ BEGIN TRY
     ALTER ROLE db_datawriter ADD MEMBER [h1b-etl];
 
     -- Step 8's schema is created by the loader, so the ETL identity needs DDL
-    -- rights: six tables, two indexes and the v_filings view.
+    -- rights: six tables, three indexes and the v_filings view.
     GRANT CREATE TABLE TO [h1b-etl];
     GRANT CREATE VIEW  TO [h1b-etl];
 
