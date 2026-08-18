@@ -1003,14 +1003,14 @@ spreadsheets costs ~15 minutes against seconds for the cache.
 #### Upload and inspect
 
 ```bash
-python -m src.etl.blob upload
+.venv/bin/python -m src.etl.blob upload
 ```
 
 Re-runnable: it skips blobs already present at the same size, so an interrupted
 upload resumes rather than restarting. `--force` overrides that.
 
 ```bash
-python -m src.etl.blob list
+.venv/bin/python -m src.etl.blob list
 ```
 
 Or through the CLI — note `--auth-mode login`, which forces the data plane onto
@@ -1363,8 +1363,13 @@ delays a message the operator needs now.
 ### Running it — PENDING
 
 ```bash
-python -m src.etl.load_azure
+.venv/bin/python -m src.etl.load_azure
 ```
+
+**The venv path is not decoration.** `python` on macOS is the system 3.9, which
+has no pandas and is below this project's 3.11 floor; `python3 -m
+src.etl.load_azure` fails with `ModuleNotFoundError: No module named 'pandas'`,
+which reads like a missing dependency and is a wrong interpreter.
 
 Locally this authenticates as your `az login`; in the container it is the
 `h1b-etl` managed identity, and the code path is identical.
