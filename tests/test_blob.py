@@ -11,7 +11,9 @@ quarter of the data — so they are checked without needing an Azure account.
 
 The round-trip tests need a real storage account and are marked ``azure``. They
 are skipped when the SDK is missing, when nobody is logged in, or when the
-container is unreachable, so a fresh clone still gets a green suite. They write
+container is unreachable, so a fresh clone still gets a green suite —
+``REQUIRE_AZURE=1`` turns those skips into failures for the CI job that holds
+the credentials and must not pass by skipping. See ``conftest.py``. They write
 to ``curated``, never to ``raw`` — the exact contents of ``raw`` are Step 7's
 acceptance criterion, and a test that scribbles there could invalidate the very
 count it is meant to protect.
@@ -24,11 +26,13 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("azure.storage.blob", reason="Azure SDK not installed")
+from conftest import require_module, unavailable
+
+require_module("azure.storage.blob", "Azure SDK not installed")
 
 from azure.core.exceptions import ResourceNotFoundError  # noqa: E402
 
-from src.etl import blob  # noqa: E402  (after importorskip, by design)
+from src.etl import blob  # noqa: E402  (after require_module, by design)
 
 CURATED = blob.CURATED_CONTAINER
 
@@ -164,13 +168,15 @@ def scratch_container():
     scribble in.
 
     Skips rather than fails on any error: no login, no role assignment, no
-    network. This suite must stay green on a machine that has never seen Azure.
+    network. This suite must stay green on a machine that has never seen Azure
+    — unless ``REQUIRE_AZURE=1`` says otherwise, which is how the CI job that
+    holds the credentials refuses to pass by skipping.
     """
     try:
         client = blob.container_client(blob.CURATED_CONTAINER)
         client.get_container_properties()
     except Exception as exc:  # noqa: BLE001 - any failure means "cannot test"
-        pytest.skip(f"{blob.account_name()}/{blob.CURATED_CONTAINER} unreachable: {exc}")
+        unavailable(f"{blob.account_name()}/{blob.CURATED_CONTAINER} unreachable: {exc}")
     return client
 
 
@@ -237,8 +243,16 @@ def test_raw_holds_exactly_the_nine_dol_caches():
 
     Catches a stray blob left in ``raw`` by anything — a crashed upload, a test
     pointed at the wrong container, a manual experiment.
+
+    Reachability is guarded the same way ``scratch_container`` guards
+    ``curated``. Without it this one test *failed* rather than skipping on a
+    machine that cannot reach the account, which contradicts the promise the
+    ``azure`` marker makes — measured, not assumed.
     """
-    names = [name for name, _ in blob.list_raw()]
+    try:
+        names = [name for name, _ in blob.list_raw()]
+    except Exception as exc:  # noqa: BLE001 - any failure means "cannot test"
+        unavailable(f"{blob.account_name()}/{blob.RAW_CONTAINER} unreachable: {exc}")
 
     # This assertion has a built-in expiry that is not a code defect.
     # storage.bicep deletes everything under raw/ after rawRetentionDays (90),
