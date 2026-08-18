@@ -25,7 +25,11 @@ from conftest import require_module
 from src import clean, ingest, load
 from src.etl import load_azure
 
-require_module("pyodbc", "ODBC driver not installed")
+# NOT a module-level pyodbc guard. Most of this file is pure pandas — the
+# golden-shape tests above all, which are what protect the refactor — and
+# guarding the module would make them vanish on any machine without the ODBC
+# driver, which is most machines. Only the tests that actually import pyodbc
+# ask for it.
 
 
 # --------------------------------------------------------------------------
@@ -42,14 +46,19 @@ def _frame(rows: int = 5) -> pd.DataFrame:
             "VISA_CLASS": "H-1B",
             "DECISION_DATE": "2025-01-15",
             "RECEIVED_DATE": "2024-11-01",
-            "EMPLOYER_NAME": ["ACME INC", "ACME INC", "GLOBEX", "GLOBEX", "INITECH"][
+            # Deliberately NOT in alphabetical order, and neither are the
+            # cities below. Ids are assigned in first-seen order; a fixture
+            # whose values happen to be sorted cannot tell that apart from
+            # alphabetical, and a drift in id assignment would pass unnoticed.
+            # Verified: renumbering the lookups alphabetically fails this file.
+            "EMPLOYER_NAME": ["ZYLO INC", "ZYLO INC", "ACME", "ACME", "MIDCO"][
                 :rows
             ],
             "JOB_TITLE": "Software Engineer",
             "SOC_CODE": "15-1252.00",
             "SOC_TITLE": "Software Developers",
-            "WORKSITE_CITY": ["austin", "austin", "austin", "seattle", "seattle"][:rows],
-            "WORKSITE_STATE": ["tx", "tx", "tx", "wa", "wa"][:rows],
+            "WORKSITE_CITY": ["seattle", "seattle", "seattle", "austin", "austin"][:rows],
+            "WORKSITE_STATE": ["wa", "wa", "wa", "tx", "tx"][:rows],
             "WAGE_RATE_OF_PAY_FROM": [100_000.0, 120_000.0, 140_000.0, 160_000.0,
                                       180_000.0][:rows],
             "WAGE_RATE_OF_PAY_TO": None,
@@ -61,30 +70,95 @@ def _frame(rows: int = 5) -> pd.DataFrame:
     )
 
 
-def test_build_tables_is_what_the_sqlite_build_writes(tmp_path):
-    """The claim the whole design rests on: one definition, two backends.
+#: What ``build_tables`` must produce for :func:`_frame`, written out in full.
+#:
+#: **Pinned, not derived.** An earlier version of this test built a SQLite
+#: database with ``load.build()`` and compared ``build_tables`` against it —
+#: which is circular, because ``load.build`` calls ``build_tables``. It compared
+#: the function to itself and would have passed no matter how far the extraction
+#: drifted.
+#:
+#: These values are trustworthy because the extraction was checked differentially
+#: against the pre-refactor ``load.py`` over 145,099 real filings from two DOL
+#: caches: all six tables identical, and the two SQLite files byte-for-byte
+#: equal. That check cannot live in the suite — it needs the old code — so its
+#: result is pinned here instead.
+#:
+#: The ids are the point. They are assigned by ``range(len(values))`` in Python,
+#: so a change in row order, in ``drop_duplicates``, or in the LOOKUPS order
+#: renumbers them, and every foreign key in ``filings`` then means something
+#: else while every count stays plausible.
+GOLDEN = {
+    "employers": {
+        "employer_id": [0, 1, 2],
+        "employer_name": ["ZYLO", "ACME", "MIDCO"],
+        "raw_name_sample": ["ZYLO INC", "ACME", "MIDCO"],
+    },
+    "occupations": {
+        "soc_id": [0],
+        "soc_code": ["15-1252"],
+        "soc_title": ["Software Developers"],
+    },
+    "titles": {"title_id": [0], "job_title": ["Software Engineer"]},
+    "locations": {
+        "location_id": [0, 1],
+        "worksite_city": ["Seattle", "Austin"],
+        "worksite_state": ["WA", "TX"],
+    },
+    "visa_classes": {"visa_class_id": [0], "visa_class": ["H-1B"]},
+    "filings": {
+        "employer_id": [0, 0, 1, 1, 2],
+        "soc_id": [0, 0, 0, 0, 0],
+        "title_id": [0, 0, 0, 0, 0],
+        "location_id": [0, 0, 0, 1, 1],
+        "visa_class_id": [0, 0, 0, 0, 0],
+        "case_prefix": [200, 200, 200, 200, 200],
+        "case_serial": [
+            25001000001, 25001000002, 25001000003, 25001000004, 25001000005
+        ],
+        "annual_wage": [100000, 120000, 140000, 160000, 180000],
+        "annual_from": [100000, 120000, 140000, 160000, 180000],
+        "annual_to": [None, None, None, None, None],
+        "prevailing_wage": [95000, 95000, 95000, 95000, 95000],
+        "fiscal_year": [2025, 2025, 2025, 2025, 2025],
+        "full_time": [1, 1, 1, 1, 1],
+        "withdrawn": [0, 0, 0, 0, 0],
+        "is_outlier": [0, 0, 0, 0, 0],
+        "pw_outlier": [0, 0, 0, 0, 0],
+        "unit_repaired": [0, 0, 0, 0, 0],
+        "pw_repaired": [0, 0, 0, 0, 0],
+    },
+}
 
-    ``build_tables`` was extracted from ``load._write`` so the Azure loader
-    could reuse it rather than compute its own ids. If the extraction drifted
-    from what SQLite actually stores, nothing would raise — the two backends
-    would simply disagree about which ``title_id`` means which title, and the
-    Step 8 equality tests would keep passing because both sides read the same
-    wrong ids. So compare against the built database, not against itself.
+
+@pytest.mark.parametrize("table", list(GOLDEN))
+def test_build_tables_matches_the_pinned_shape(table):
+    """One definition of the data, and it must not move under either backend."""
+    produced = load.build_tables(clean.clean(_frame()))[table]
+    expected = pd.DataFrame(GOLDEN[table])
+
+    assert list(produced.columns) == list(expected.columns), table
+    pd.testing.assert_frame_equal(
+        produced.reset_index(drop=True).astype(object).where(pd.notna(produced), None),
+        expected.astype(object).where(pd.notna(expected), None),
+        check_dtype=False,
+    )
+
+
+def test_the_sqlite_build_stores_exactly_the_pinned_shape(tmp_path):
+    """And the database really does receive it — the other half of the claim.
+
+    Reads the built file back rather than trusting the writer, so a ``to_sql``
+    that silently dropped or reordered a column would fail here.
     """
-    cleaned = clean.clean(_frame())
-    path, _ = load.build(cleaned, tmp_path / "small.db")
-
+    path, _ = load.build(clean.clean(_frame()), tmp_path / "small.db")
     connection = sqlite3.connect(path)
     try:
-        for table, frame in load.build_tables(cleaned).items():
+        for table, expected in GOLDEN.items():
             stored = pd.read_sql_query(
-                f"SELECT {', '.join(frame.columns)} FROM {table}", connection
+                f"SELECT {', '.join(expected)} FROM {table}", connection
             )
-            pd.testing.assert_frame_equal(
-                stored.reset_index(drop=True),
-                frame.reset_index(drop=True),
-                check_dtype=False,
-            )
+            assert stored.to_dict("list") == expected, table
     finally:
         connection.close()
 
@@ -231,6 +305,7 @@ def test_verify_refuses_a_short_load():
 
 def test_connect_awake_waits_out_a_resume(monkeypatch):
     """The most likely reason this job fails, and it is not a fault."""
+    require_module("pyodbc", "ODBC driver not installed")
     import pyodbc
 
     attempts = {"n": 0}
@@ -249,6 +324,7 @@ def test_connect_awake_waits_out_a_resume(monkeypatch):
 
 
 def test_connect_awake_gives_up_and_says_what_it_waited_for(monkeypatch):
+    require_module("pyodbc", "ODBC driver not installed")
     import pyodbc
 
     def always_asleep():
