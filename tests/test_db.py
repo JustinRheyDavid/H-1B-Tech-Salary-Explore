@@ -25,7 +25,6 @@ Azure is unreachable or empty.
 
 from __future__ import annotations
 
-import os
 import sqlite3
 import subprocess
 import sys
@@ -34,6 +33,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from conftest import require_module, unavailable
 from src import clean, load, queries
 from src.db import BACKEND_ENV, METHODS, Backend, get_backend
 from src.db.sqlite_impl import SQLiteBackend
@@ -98,7 +98,7 @@ def test_azure_backend_satisfies_the_protocol():
     connection. It needs ``pyodbc`` importable only because ``TROUBLE`` names
     ``pyodbc.Error``.
     """
-    pytest.importorskip("pyodbc", reason="ODBC driver not installed")
+    require_module("pyodbc", "ODBC driver not installed")
     import pyodbc
     from azure.core.exceptions import ClientAuthenticationError
 
@@ -173,9 +173,11 @@ def test_importing_the_package_does_not_require_the_azure_sdk():
     broke the moment a conformance test was added above it. A subprocess tests
     the property itself.
     """
+    # Exit 3 for "pulled it in", so it cannot be confused with the interpreter
+    # exiting 1 because the import itself raised — two different bugs.
     probe = (
         "import sys; import src.db; "
-        "sys.exit(1 if 'src.db.azure_impl' in sys.modules else 0)"
+        "sys.exit(3 if 'src.db.azure_impl' in sys.modules else 0)"
     )
     result = subprocess.run(
         [sys.executable, "-c", probe],
@@ -183,8 +185,10 @@ def test_importing_the_package_does_not_require_the_azure_sdk():
         capture_output=True,
         text=True,
     )
+    if result.returncode == 3:
+        pytest.fail("importing src.db pulled in azure_impl")
     assert result.returncode == 0, (
-        f"importing src.db pulled in azure_impl\n{result.stdout}{result.stderr}"
+        f"importing src.db failed outright\n{result.stdout}{result.stderr}"
     )
 
 
@@ -312,34 +316,10 @@ def _mirror_azure_into_sqlite(azure, destination: Path) -> int:
     return filings
 
 
-#: Set ``REQUIRE_AZURE=1`` to turn every skip below into a failure.
-#:
-#: The skips exist so a clone with no Azure account still runs green, and that
-#: is right for a contributor. It is wrong for the one CI job whose entire
-#: purpose is to exercise Azure: a paused database, an expired federated
-#: credential or a missing ODBC driver would each report success while testing
-#: nothing. This flag is what lets the same tests serve both.
-REQUIRE_AZURE = "REQUIRE_AZURE"
-
-
-def _azure_is_mandatory() -> bool:
-    return os.environ.get(REQUIRE_AZURE, "").strip().lower() in {"1", "true", "yes"}
-
-
-def _unavailable(reason: str):
-    """Skip, or fail if the environment said these tests are mandatory."""
-    if _azure_is_mandatory():
-        pytest.fail(f"{REQUIRE_AZURE} is set, but the Azure tests cannot run: {reason}")
-    pytest.skip(reason)
-
-
 @pytest.fixture(scope="module")
 def backends(tmp_path_factory):
     """An Azure backend and a SQLite backend holding identical rows."""
-    try:
-        import pyodbc  # noqa: F401
-    except ImportError as exc:
-        _unavailable(f"ODBC driver not installed: {exc}")
+    require_module("pyodbc", "ODBC driver not installed")
     from src.db.azure_impl import AzureBackend
 
     azure = AzureBackend()
@@ -347,9 +327,9 @@ def backends(tmp_path_factory):
     try:
         rows = _mirror_azure_into_sqlite(azure, mirror)
     except Exception as exc:  # noqa: BLE001 - any failure means "cannot compare"
-        _unavailable(f"Azure unreachable: {exc}")
+        unavailable(f"Azure unreachable: {exc}")
     if rows == 0:
-        _unavailable("Azure filings table is empty; load it before comparing")
+        unavailable("Azure filings table is empty; load it before comparing")
     return azure, SQLiteBackend(db=mirror)
 
 

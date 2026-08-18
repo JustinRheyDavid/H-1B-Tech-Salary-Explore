@@ -1254,9 +1254,21 @@ credential would report success while testing nothing.
 REQUIRE_AZURE=1 pytest -m azure
 ```
 
-turns every one of those skips into a failure. Verified both ways against an
-unreachable server: unset gives `16 skipped` and exit 0; set gives `16 errors`
-and exit 1.
+turns every one of those skips into a failure — across **both** suites, the
+Azure SQL tests in `tests/test_db.py` and the storage tests in
+`tests/test_blob.py`. The flag lives in `conftest.py` for that reason: an
+earlier version defined it inside `test_db.py` only, which left the four blob
+cases free to skip silently under a flag documented as preventing exactly that.
+
+Verified against an unreachable storage account, both ways:
+
+| | flag unset | `REQUIRE_AZURE=1` |
+|---|---|---|
+| result | `16 passed, 4 skipped` | `16 passed, 1 failed, 3 errors` |
+| exit code | 0 — a clone stays green | 1 — CI cannot pass by skipping |
+
+Zero skips under the flag is the property that matters; a count of 4 there
+would mean the guard had a hole in it.
 
 **Decision for Step 11:** CI runs the suite twice — once without the flag (the
 contributor's path, Azure optional) and once with `REQUIRE_AZURE=1` on the job
