@@ -3,10 +3,13 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–8 done. Every value below was read from a live `az` command
-or a real SQL connection rather than transcribed. The rest of the data path
-(Step 9 onward) and teardown are still `<TO BE WRITTEN>`; any remaining
-`<FILL IN>` is a real blank, not a placeholder for something already known.
+**Status:** Steps 1–8 done. **Step 9 is written and tested but has not been
+run** — the load itself and the image build are the two things below marked
+PENDING, and neither has happened, so no row count in §9 is a measurement yet.
+Every other value in this file was read from a live `az` command or a real SQL
+connection rather than transcribed. Step 10 onward and teardown are still
+`<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real blank, not a placeholder
+for something already known.
 
 The build plan this follows is [`docs/plans/azure-migration.md`](plans/azure-migration.md).
 
@@ -1289,6 +1292,116 @@ Two divergences are asserted as acceptable rather than fixed:
 - [x] `PERCENTILE_CONT` confirmed equal to Phase 1's interpolation
 - [x] 123,990 titles load with no rejections
 - [x] Schema script is re-runnable and asserts its own invariants
+
+---
+
+## 4b. Step 9 — load Azure SQL from Blob
+
+**Status: code complete, not yet executed.** Everything in this section is
+either a verified mechanism or a PENDING step. The row counts are the plan's
+acceptance criterion, not a reading.
+
+```
+LOADER  = src/etl/load_azure.py    download -> clean -> curated -> bulk insert
+IMAGE   = Dockerfile.etl           python:3.11-slim + msodbcsql18
+TESTS   = tests/test_load_azure.py 15 offline, 1 against the live database
+```
+
+### One definition of the data, two backends
+
+`src/load.py` grew `build_tables(cleaned)`: the frame-shaping and **every
+primary key**, in pure pandas with no database attached. Phase 1's SQLite
+writer and the Azure loader both call it.
+
+This is the part worth understanding. Every id is assigned by
+`range(len(values))` in Python, never by the database — which is why the T-SQL
+schema declares plain `INT` keys and asserts no `IDENTITY` column exists. Two
+loaders computing their own ids would not raise when they disagreed; they would
+attach the wrong employers to the right wages, and Step 8's equality tests would
+go on passing because both sides would be reading the same wrong ids.
+`tests/test_load_azure.py` compares `build_tables` against what the SQLite
+database actually stores, rather than against itself.
+
+`src/ingest.py` grew `combine(frames)` for the same reason. The container has
+the Parquet caches but no `.xlsx`, so it cannot call `load_all` — and `combine`
+is the half of `load_all` that resolves the 20,873 cases appearing in two files.
+A loader that concatenated without it would load 871,194 rows, and every count
+here would be wrong by the same amount.
+
+### The load replaces; it does not append
+
+Azure is **not empty**: Step 8 seeded the five lookups in full plus 70,949
+`Software Engineer` filings so the equality tests had something to compare. Since
+ids restart at 0 on every run, an append collides on the first row.
+
+`clear()` therefore empties everything first, children before parents:
+
+- `TRUNCATE TABLE dbo.filings` — allowed, because nothing references `filings`;
+  its foreign keys point outward.
+- `DELETE` for the five lookups — SQL Server refuses `TRUNCATE` on any table
+  named by a foreign key constraint *even when the referencing table is empty*.
+
+Verified against the live database, including that a rollback restores it: the
+probe cleared all six tables, inserted, then rolled back, and all 70,949 filings
+and 123,990 titles came back exactly.
+
+The whole write is one transaction. A failure partway through six tables would
+otherwise leave lookups from this run beside filings from the last — a state no
+row total would reveal, because the totals would look plausible and only the
+joins would be wrong.
+
+### The paused database is the expected failure, not an error
+
+`connect_awake()` retries for up to 5 minutes at 15-second intervals. The
+database is serverless with `autoPauseDelay: 60`, so the first connection after
+an idle hour is *refused* — `Login timeout expired` or `Database ... is not
+currently available` — while the resume happens behind it. This bit twice during
+Step 9's own development. Only connection errors are retried; a bad token or a
+missing driver is raised immediately, because retrying it for five minutes only
+delays a message the operator needs now.
+
+### Running it — PENDING
+
+```bash
+python -m src.etl.load_azure
+```
+
+Locally this authenticates as your `az login`; in the container it is the
+`h1b-etl` managed identity, and the code path is identical.
+
+**Acceptance criterion** — the plan's numbers, none of them yet observed:
+
+| table | expected |
+|---|---|
+| `filings` | 850,321 |
+| `employers` | 43,573 |
+| `titles` | 123,990 |
+| `locations` | 8,570 |
+| `occupations` | 63 |
+| `visa_classes` | 4 |
+
+`titles` is the number that proves the Step 8 collation fix held at full scale;
+`filings` is the number that proves `combine()` deduplicated. Both are asserted
+by `test_azure_holds_the_full_dataset`, which **skips** while the database still
+holds Step 8's 70,949-row seed rather than reporting a false pass.
+
+### Building and pushing the image — PENDING
+
+```bash
+docker build -f Dockerfile.etl -t ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest .
+docker push ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest
+az containerapp job update -g rg-h1b -n <job> --image ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest
+az containerapp job start -g rg-h1b -n <job>
+```
+
+GHCR paths must be lowercase; the repository's own capitalization does not
+survive into the image name.
+
+**This machine has no container runtime** — no Docker, no podman, no colima —
+so the image has never been built, and nothing in `Dockerfile.etl` beyond its
+syntax has been exercised. The Debian 12 / `bookworm` repository path in it is
+the one that matches `python:3.11-slim`; a `bullseye` path installs a driver
+that will not load.
 
 ---
 

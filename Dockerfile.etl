@@ -1,0 +1,58 @@
+# The ETL job: downloads the DOL caches from Blob and loads Azure SQL.
+#
+# Plan Step 9. Run as a Container Apps job with the h1b-etl managed identity —
+# there is no connection string and no account key in this image, because
+# neither exists: the storage account has allowSharedKeyAccess disabled and the
+# SQL server has azureADOnlyAuthentication enabled.
+#
+#   docker build -f Dockerfile.etl -t ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest .
+#
+# GHCR paths must be lowercase, so the repository's own capitalization does not
+# survive into the image name.
+
+FROM python:3.11-slim
+
+# The Microsoft ODBC driver. pyodbc is a binding, not a driver: pip installs it
+# happily and then every connection fails with "Can't open lib 'ODBC Driver 18
+# for SQL Server'", which reads like a missing Python package and is not one.
+#
+# Debian 12 (bookworm) is what python:3.11-slim is built on, and the repository
+# path has to match — the bullseye list installs a driver that will not load.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl gnupg unixodbc \
+ && curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+      | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+      > /etc/apt/sources.list.d/mssql.list \
+ && apt-get update \
+ && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+ && apt-get purge -y curl gnupg \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# One requirements.txt, installed whole. It carries streamlit and plotly, which
+# this job never imports, and trimming them would mean a second pinned list to
+# keep in step with the first. The plan's own B-series assumptions put a single
+# verified-together pin set above image size, and this job runs monthly — the
+# pull cost lands on nothing a visitor waits for. Dockerfile.web is where size
+# will actually matter, because that one cold-starts in front of a person.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+
+# Unbuffered, and this is not a nicety. Python block-buffers stdout when it is
+# not a terminal, so a job that dies partway through prints nothing at all and
+# the Container Apps log shows a successful-looking silence. The same buffering
+# hid which call was slow while timing this pipeline.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Nothing here needs root, and the managed identity is granted to the container,
+# not to a user inside it.
+RUN useradd --create-home --uid 10001 etl
+USER etl
+
+ENTRYPOINT ["python", "-m", "src.etl.load_azure"]
