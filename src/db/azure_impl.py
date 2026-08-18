@@ -63,9 +63,27 @@ _CI = "Latin1_General_CI_AS"
 # Resolved through the lookup table so the index on filings(title_id) applies,
 # exactly as Phase 1 does. Matching case-insensitively against the joined view
 # instead cost 156 ms where this costs 7 ms on SQLite.
+#
+# **Matched on key_exact, not on job_title, and that is not a micro-optimisation.**
+# SQL Server pads both operands to equal length before comparing, whatever the
+# collation, so `job_title = 'Software Engineer'` also matches 'Software Engineer'
+# with one, three, or twenty-five trailing spaces. SQLite does not pad. The two
+# backends therefore answered different questions: 71,780 filings against 70,943
+# for the same title, across twenty distinct spellings from 34 to 86 bytes.
+#
+# Step 8 built key_exact — job_title with a '.' appended — so that a trailing
+# space becomes an *interior* space, and interior spaces are never padding. It
+# was added to make the UNIQUE constraint work; it fixes the comparison for the
+# same reason. Appending the sentinel to the parameter too keeps the caller
+# passing a plain title.
+#
+# This did not show up at Step 8 because the seed was itself selected with
+# SQLite's exact semantics, so the trailing-space rows it would have swept in
+# were not in the database yet. It surfaced the moment Step 9 loaded all
+# 850,321 rows.
 _TITLE_MATCHES = (
     f"f.title_id IN (SELECT title_id FROM titles "
-    f"WHERE job_title COLLATE {_CI} = ?)"
+    f"WHERE key_exact COLLATE {_CI} = ? + N'.')"
 )
 
 # One median, as a window function over a partition.
@@ -466,8 +484,17 @@ class AzureBackend:
         else, and the autocomplete would quietly stop working for most of what
         people type. This is the query that runs on every keystroke.
 
-        ``GROUP BY LOWER(job_title)`` cannot then select the bare column, so the
-        representative spelling is ``MIN``. Phase 1 lets SQLite pick arbitrarily
+        ``GROUP BY LOWER(key_exact)``, not ``LOWER(job_title)`` — the sentinel
+        again. Grouping on the bare column merges 'SOFTWARE ENGINEER' with
+        'SOFTWARE ENGINEER ' because the padded comparison makes them equal,
+        while SQLite keeps them apart; the picker then offered one entry where
+        Phase 1 offers two, and every entry below it shifted. That has to match
+        the filter: :data:`_TITLE_MATCHES` selects the exact spelling, so an
+        entry that silently stood for two spellings would return the filings of
+        only one of them.
+
+        The grouped select cannot name the bare column, so the representative
+        spelling is ``MIN``. Phase 1 lets SQLite pick arbitrarily
         from the group, so **the two backends can return different capitalisations
         of the same title** — a documented divergence, not a porting bug. Either
         spelling finds the same filings, because every query here matches titles
@@ -483,7 +510,7 @@ class AzureBackend:
             FROM filings f
             JOIN titles t ON t.title_id = f.title_id
             WHERE t.job_title COLLATE {_CI} LIKE ? + '%' ESCAPE '\'
-            GROUP BY LOWER(t.job_title)
+            GROUP BY LOWER(t.key_exact)
             ORDER BY n DESC, MIN(t.job_title)
             """,
             [

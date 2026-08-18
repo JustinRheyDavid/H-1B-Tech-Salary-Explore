@@ -3,11 +3,10 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–8 done. **Step 9 is written and tested but has not been
-run** — the load itself and the image build are the two things below marked
-PENDING, and neither has happened, so no row count in §9 is a measurement yet.
-Every other value in this file was read from a live `az` command or a real SQL
-connection rather than transcribed. Step 10 onward and teardown are still
+**Status:** Steps 1–9 done, except the ETL **image**, which has never been built
+— see §4b. The load has run and Azure SQL holds all 850,321 filings. Every value
+in this file was read from a live `az` command or a real SQL connection rather
+than transcribed. Step 10 onward and teardown are still
 `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real blank, not a placeholder
 for something already known.
 
@@ -1297,9 +1296,9 @@ Two divergences are asserted as acceptable rather than fixed:
 
 ## 4b. Step 9 — load Azure SQL from Blob
 
-**Status: code complete, not yet executed.** Everything in this section is
-either a verified mechanism or a PENDING step. The row counts are the plan's
-acceptance criterion, not a reading.
+**Status: loaded 2026-08-18.** The row counts below were read from the database,
+not transcribed from the plan. The container image is the one part still
+PENDING.
 
 ```
 LOADER  = src/etl/load_azure.py    download -> clean -> curated -> bulk insert
@@ -1360,7 +1359,7 @@ Step 9's own development. Only connection errors are retried; a bad token or a
 missing driver is raised immediately, because retrying it for five minutes only
 delays a message the operator needs now.
 
-### Running it — PENDING
+### Running it — done
 
 ```bash
 .venv/bin/python -m src.etl.load_azure
@@ -1374,16 +1373,56 @@ which reads like a missing dependency and is a wrong interpreter.
 Locally this authenticates as your `az login`; in the container it is the
 `h1b-etl` managed identity, and the code path is identical.
 
-**Acceptance criterion** — the plan's numbers, none of them yet observed:
+**Acceptance criterion — met.** Counted twice, through pyodbc and again through
+`sqlcmd` unpiped so the exit code was real:
 
-| table | expected |
-|---|---|
-| `filings` | 850,321 |
-| `employers` | 43,573 |
-| `titles` | 123,990 |
-| `locations` | 8,570 |
-| `occupations` | 63 |
-| `visa_classes` | 4 |
+| table | expected | actual |
+|---|---|---|
+| `filings` | 850,321 | **850,321** |
+| `employers` | 43,573 | **43,573** |
+| `titles` | 123,990 | **123,990** |
+| `locations` | 8,570 | **8,570** |
+| `occupations` | 63 | **63** |
+| `visa_classes` | 4 | **4** |
+
+Insert time was 270s of the run: `filings` 215.9s, `titles` 25.4s, `employers`
+27.1s, the rest under 2s each. The wall-clock figure the loader printed (4,826s)
+spans a machine suspend and is not a measure of anything.
+
+### What the full load exposed, and Step 8 could not have
+
+**The two backends were answering different questions, and every equality test
+passed anyway.** With all 850,321 rows loaded, 12 of the 16 Step 8 equality
+tests failed. The cause is the trailing-space padding from §8, resurfacing on
+the *query* side rather than the storage side:
+
+`job_title COLLATE Latin1_General_CI_AS = 'Software Engineer'` matches **twenty
+distinct spellings** in Azure — 34 to 86 bytes, differing only in case and
+trailing spaces — because SQL Server pads both operands before comparing.
+SQLite does not pad. Same title, **71,780 filings against 70,943**.
+
+This was invisible at Step 8 because the seed was itself selected with SQLite's
+exact semantics: the trailing-space rows the padded comparison would sweep in
+were not in the database yet. Only the full load could show it.
+
+Both fixes reuse `titles.key_exact`, the sentinel column built at Step 8 for the
+UNIQUE constraint — a trailing space becomes an interior space, and interior
+spaces are never padding:
+
+- `_TITLE_MATCHES` compares `key_exact = ? + N'.'`. Verified: 70,949 rows,
+  exactly SQLite's answer.
+- `title_search` groups on `LOWER(key_exact)`. Grouping on the bare column
+  merged `'SOFTWARE ENGINEER'` with `'SOFTWARE ENGINEER '`, so the picker
+  offered one entry where Phase 1 offers two and everything below it shifted.
+  This *has* to match the filter: an entry standing for two spellings would
+  return the filings of only one.
+
+One Phase 1 change came with it. `queries.title_search` selected a bare
+`job_title` while grouping on `lower(job_title)` — SQLite returns an arbitrary
+group member, which makes the `ORDER BY n DESC` tiebreak arbitrary too. It is
+`min(job_title)` now: deterministic between runs, and equal to the port.
+
+All 16 equality tests pass against the full dataset.
 
 `titles` is the number that proves the Step 8 collation fix held at full scale;
 `filings` is the number that proves `combine()` deduplicated. Both are asserted
