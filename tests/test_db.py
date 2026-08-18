@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -84,6 +86,33 @@ def test_the_interface_covers_everything_app_py_calls():
     assert called <= interface, f"app.py uses {called - interface}, absent from the Backend"
 
 
+def test_azure_backend_satisfies_the_protocol():
+    """The half of the interface that was untested, and the half that motivated it.
+
+    ``TROUBLE`` exists because hardcoding ``sqlite3.Error`` in ``app.py`` would
+    let an Azure failure — paused database, expired token — escape as an
+    unhandled exception and render a traceback to a visitor. The SQLite side of
+    that was asserted and the Azure side was not, which is backwards.
+
+    Offline: it imports the module and reads attributes, and never opens a
+    connection. It needs ``pyodbc`` importable only because ``TROUBLE`` names
+    ``pyodbc.Error``.
+    """
+    pytest.importorskip("pyodbc", reason="ODBC driver not installed")
+    import pyodbc
+    from azure.core.exceptions import ClientAuthenticationError
+
+    from src.db.azure_impl import AzureBackend
+
+    backend = AzureBackend()
+    assert isinstance(backend, Backend)
+    for name in METHODS:
+        assert callable(getattr(backend, name)), name
+    assert backend.DEFAULT_JOB_TITLE == queries.DEFAULT_JOB_TITLE
+    assert pyodbc.Error in backend.TROUBLE
+    assert ClientAuthenticationError in backend.TROUBLE
+
+
 def test_both_backends_declare_the_non_method_members():
     """``DEFAULT_JOB_TITLE`` and ``TROUBLE`` are interface members too.
 
@@ -135,10 +164,28 @@ def test_importing_the_package_does_not_require_the_azure_sdk():
 
     If ``azure_impl`` were imported at module level, a machine with no ODBC
     driver — which is most machines — could not run the Phase 1 dashboard.
-    """
-    import src.db
 
-    assert "azure_impl" not in dir(src.db)
+    Runs in a **fresh interpreter**, and that is the point. An earlier version
+    asserted ``"azure_impl" not in dir(src.db)`` in-process, which passed only
+    while no earlier test in the session had imported the submodule — importing
+    it binds it as an attribute of the parent package. That made the test a
+    statement about test ordering rather than about the import graph, and it
+    broke the moment a conformance test was added above it. A subprocess tests
+    the property itself.
+    """
+    probe = (
+        "import sys; import src.db; "
+        "sys.exit(1 if 'src.db.azure_impl' in sys.modules else 0)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"importing src.db pulled in azure_impl\n{result.stdout}{result.stderr}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -152,10 +199,18 @@ def small_db(tmp_path):
 
     Deliberately NOT ``data/h1b.db``. These tests prove the adapter *delegates*
     — that it adds nothing and changes nothing — and a five-row database proves
-    that as well as an 850,321-row one. An earlier draft pointed them at the real
-    database and ``top_employers`` ran for minutes: its second CTE opens a window
-    over every filing for the title, which is a fine shape for a dashboard that
-    caches and a terrible one for a test that runs on every commit.
+    that as well as an 850,321-row one, while staying independent of whether the
+    real database has been built.
+
+    An earlier draft pointed them at the real database, and an earlier version of
+    this docstring blamed ``top_employers`` for "running for minutes". That was
+    wrong, and measurement is the reason it is corrected here rather than
+    repeated: against all 850,321 rows it takes 0.11 s filtered, 0.25 s for a
+    city, 0.63 s unfiltered, through the adapter or directly. The apparent hang
+    came from timing it in a *backgrounded* process, which absorbs machine
+    suspend into wall clock — the tell was that the reported figures, 42 minutes
+    and 21 hours, were human-shaped rather than query-shaped, while the four
+    calls either side of it in the same run read 0.05 s.
     """
     frame = pd.DataFrame(
         {
@@ -257,10 +312,34 @@ def _mirror_azure_into_sqlite(azure, destination: Path) -> int:
     return filings
 
 
+#: Set ``REQUIRE_AZURE=1`` to turn every skip below into a failure.
+#:
+#: The skips exist so a clone with no Azure account still runs green, and that
+#: is right for a contributor. It is wrong for the one CI job whose entire
+#: purpose is to exercise Azure: a paused database, an expired federated
+#: credential or a missing ODBC driver would each report success while testing
+#: nothing. This flag is what lets the same tests serve both.
+REQUIRE_AZURE = "REQUIRE_AZURE"
+
+
+def _azure_is_mandatory() -> bool:
+    return os.environ.get(REQUIRE_AZURE, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _unavailable(reason: str):
+    """Skip, or fail if the environment said these tests are mandatory."""
+    if _azure_is_mandatory():
+        pytest.fail(f"{REQUIRE_AZURE} is set, but the Azure tests cannot run: {reason}")
+    pytest.skip(reason)
+
+
 @pytest.fixture(scope="module")
 def backends(tmp_path_factory):
     """An Azure backend and a SQLite backend holding identical rows."""
-    pytest.importorskip("pyodbc", reason="ODBC driver not installed")
+    try:
+        import pyodbc  # noqa: F401
+    except ImportError as exc:
+        _unavailable(f"ODBC driver not installed: {exc}")
     from src.db.azure_impl import AzureBackend
 
     azure = AzureBackend()
@@ -268,9 +347,9 @@ def backends(tmp_path_factory):
     try:
         rows = _mirror_azure_into_sqlite(azure, mirror)
     except Exception as exc:  # noqa: BLE001 - any failure means "cannot compare"
-        pytest.skip(f"Azure unreachable: {exc}")
+        _unavailable(f"Azure unreachable: {exc}")
     if rows == 0:
-        pytest.skip("Azure filings table is empty; load it before comparing")
+        _unavailable("Azure filings table is empty; load it before comparing")
     return azure, SQLiteBackend(db=mirror)
 
 

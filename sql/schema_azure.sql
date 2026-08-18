@@ -126,8 +126,19 @@ CREATE TABLE dbo.titles (
     title_id  INT           NOT NULL PRIMARY KEY,
     job_title NVARCHAR(100) COLLATE Latin1_General_BIN2 NOT NULL,
     key_exact AS (job_title + N'.') PERSISTED,
-    CONSTRAINT uq_titles_job_title UNIQUE (key_exact)
+    -- Named for the column it is ON. An earlier version called this
+    -- uq_titles_job_title, which asserts the opposite of the design: the whole
+    -- point is that the UNIQUE is NOT on job_title, and the assertion block
+    -- below throws if it ever is.
+    CONSTRAINT uq_titles_key_exact UNIQUE (key_exact)
 );
+GO
+
+-- Converge a database created before the rename. Metadata only: sp_rename on a
+-- unique constraint renames the constraint and its backing index, touches no
+-- rows, and is a no-op once it has run.
+IF EXISTS (SELECT 1 FROM sys.objects WHERE name = 'uq_titles_job_title' AND type = 'UQ')
+    EXEC sp_rename N'dbo.uq_titles_job_title', N'uq_titles_key_exact', N'OBJECT';
 GO
 
 -- Phase 1 got this index for free from the UNIQUE constraint on job_title.
@@ -331,5 +342,5 @@ IF (SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()) < 160
 IF @problems <> N''
     THROW 50000, @problems, 1;
 
-PRINT 'schema ok: 6 tables, 2 indexes, 1 view, BIN2 confirmed';
+PRINT 'schema ok: 6 tables, 3 indexes, 1 view, BIN2 confirmed';
 GO

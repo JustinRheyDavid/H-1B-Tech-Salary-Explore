@@ -1231,15 +1231,37 @@ merge — rather than assuming empty tables.
 #### Verification
 
 ```
-21 offline tests   Protocol shape, backend selection, adapter transparency
+22 offline tests   Protocol shape (both backends), backend selection, adapter
+                   transparency
 16 live tests      all seven functions, both backends, same rows, equal output
-282 total          full suite, both markers
+283 total          full suite, both markers
 ```
 
 The equality tests are **read-only against Azure**: they mirror whatever the
 database currently holds into a temporary SQLite file and ask both backends the
 same questions. Nothing seeds or truncates the real tables, so they stay safe to
 run after Step 9 loads 850,321 rows.
+
+### `REQUIRE_AZURE=1` — for CI, and only for CI
+
+The 16 live tests **skip** when the ODBC driver is missing, nobody is logged in,
+or the database is unreachable, so a clone with no Azure account still runs
+green. That is right for a contributor and wrong for the one CI job whose whole
+purpose is to exercise Azure: a paused database or an expired federated
+credential would report success while testing nothing.
+
+```bash
+REQUIRE_AZURE=1 pytest -m azure
+```
+
+turns every one of those skips into a failure. Verified both ways against an
+unreachable server: unset gives `16 skipped` and exit 0; set gives `16 errors`
+and exit 1.
+
+**Decision for Step 11:** CI runs the suite twice — once without the flag (the
+contributor's path, Azure optional) and once with `REQUIRE_AZURE=1` on the job
+that holds the OIDC credentials. A green badge on a public repo should not be
+able to mean "everything skipped".
 
 Two divergences are asserted as acceptable rather than fixed:
 
