@@ -39,6 +39,7 @@ import pandas as pd
 __all__ = [
     "SCHEMA",
     "build",
+    "build_tables",
     "connect",
     "main",
     "split_case_number",
@@ -280,29 +281,86 @@ def split_case_number(numbers: pd.Series) -> tuple[pd.Series, pd.Series]:
     return prefix, serial
 
 
-def _write_lookup(
-    connection: sqlite3.Connection,
+def _build_lookup(
     frame: pd.DataFrame,
-    table: str,
     id_column: str,
     keys: list[str],
     payload: str | None,
-) -> pd.Series:
-    """Write one lookup table; return the id each row of ``frame`` maps to.
+) -> tuple[pd.DataFrame, pd.Series]:
+    """One lookup table, plus the id each row of ``frame`` maps to.
 
     Joined back rather than mapped through a dict so that a multi-column key
     works the same way a single-column one does.
+
+    No connection: the ids are assigned here, in pandas, so that every backend
+    receives the *same* table rather than computing its own. See
+    :func:`build_tables`.
     """
     columns = keys + ([payload] if payload else [])
     values = frame[columns].drop_duplicates(subset=keys).reset_index(drop=True)
     values.insert(0, id_column, range(len(values)))
-    values.to_sql(table, connection, if_exists="append", index=False)
 
     ids = frame[keys].merge(values[[*keys, id_column]], on=keys, how="left")
     if ids[id_column].isna().any():
         unmatched = int(ids[id_column].isna().sum())
-        raise RuntimeError(f"{table}: {unmatched} rows unmatched")
-    return pd.Series(ids[id_column].to_numpy(), index=frame.index).astype("int64")
+        raise RuntimeError(f"{id_column}: {unmatched} rows unmatched")
+    return values, pd.Series(ids[id_column].to_numpy(), index=frame.index).astype(
+        "int64"
+    )
+
+
+def build_tables(cleaned: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Shape cleaned filings into the six tables, keyed by table name.
+
+    **This is the single definition of what the database contains**, and it is
+    deliberately free of any database. Phase 1 writes the result to SQLite;
+    ``src/etl/load_azure.py`` writes the same result to Azure SQL. Two loaders
+    computing their own ids would be two chances to disagree about which
+    ``title_id`` means which title — and the disagreement would not raise, it
+    would silently attach the wrong employers to the right wages.
+
+    Every id is assigned here, by ``range(len(values))``, never by the database.
+    Azure SQL's schema declares plain ``INT`` keys for exactly this reason: an
+    ``IDENTITY`` column would renumber the lookups and detach every foreign key
+    in ``filings`` from the row it pointed at, while the load *succeeded*.
+
+    Returned in insertion order — the five lookups first, ``filings`` last —
+    because the foreign keys make that order mandatory on any backend that
+    enforces them.
+    """
+    # NOT NULL on the lookup keys means a missing city cannot be NULL here;
+    # it becomes its own row and stays visibly empty rather than silently
+    # dropping the filing out of every city aggregate.
+    source = cleaned.assign(
+        raw_name_sample=cleaned["employer_raw"],
+        worksite_city=cleaned["worksite_city"].fillna(""),
+        worksite_state=cleaned["worksite_state"].fillna(""),
+    )
+
+    tables: dict[str, pd.DataFrame] = {}
+    filings = pd.DataFrame(index=cleaned.index)
+    for table, id_column, keys, payload in LOOKUPS:
+        values, ids = _build_lookup(source, id_column, keys, payload)
+        tables[table] = values
+        filings[id_column] = ids
+
+    prefix, serial = split_case_number(cleaned["case_number"])
+    filings["case_prefix"] = prefix
+    filings["case_serial"] = serial
+
+    for column in ("annual_wage", "annual_from", "annual_to", "prevailing_wage"):
+        filings[column] = cleaned[column].round().astype("Int64")
+
+    filings["fiscal_year"] = cleaned["fiscal_year"].astype("int64")
+    filings["full_time"] = cleaned["full_time"].astype("int64")
+    filings["withdrawn"] = (
+        cleaned["case_status"].eq("Certified - Withdrawn").astype("int64")
+    )
+    for flag in ("is_outlier", "pw_outlier", "unit_repaired", "pw_repaired"):
+        filings[flag] = cleaned[flag].astype("int64")
+
+    tables["filings"] = filings
+    return tables
 
 
 def build(
@@ -397,37 +455,8 @@ def _write(cleaned: pd.DataFrame, path: Path) -> None:
     try:
         connection.executescript(SCHEMA)
 
-        # NOT NULL on the lookup keys means a missing city cannot be NULL here;
-        # it becomes its own row and stays visibly empty rather than silently
-        # dropping the filing out of every city aggregate.
-        source = cleaned.assign(
-            raw_name_sample=cleaned["employer_raw"],
-            worksite_city=cleaned["worksite_city"].fillna(""),
-            worksite_state=cleaned["worksite_state"].fillna(""),
-        )
-
-        filings = pd.DataFrame(index=cleaned.index)
-        for table, id_column, keys, payload in LOOKUPS:
-            filings[id_column] = _write_lookup(
-                connection, source, table, id_column, keys, payload
-            )
-
-        prefix, serial = split_case_number(cleaned["case_number"])
-        filings["case_prefix"] = prefix
-        filings["case_serial"] = serial
-
-        for column in ("annual_wage", "annual_from", "annual_to", "prevailing_wage"):
-            filings[column] = cleaned[column].round().astype("Int64")
-
-        filings["fiscal_year"] = cleaned["fiscal_year"].astype("int64")
-        filings["full_time"] = cleaned["full_time"].astype("int64")
-        filings["withdrawn"] = (
-            cleaned["case_status"].eq("Certified - Withdrawn").astype("int64")
-        )
-        for flag in ("is_outlier", "pw_outlier", "unit_repaired", "pw_repaired"):
-            filings[flag] = cleaned[flag].astype("int64")
-
-        filings.to_sql("filings", connection, if_exists="append", index=False)
+        for table, frame in build_tables(cleaned).items():
+            frame.to_sql(table, connection, if_exists="append", index=False)
         connection.commit()
 
         loaded = connection.execute("SELECT COUNT(*) FROM filings").fetchone()[0]

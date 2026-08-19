@@ -426,9 +426,16 @@ def title_search(
     Ordered by popularity rather than alphabetically: the first thing anyone
     types is "data", and they want Data Engineer before DATA  ARCHITECT.
 
-    Spellings that differ only in case are one entry, represented by whichever
-    the database happens to return for the group. Any of them finds the same
-    filings, because every query here matches titles case-insensitively.
+    Spellings that differ only in case are one entry, represented by ``min`` of
+    the group. Any of them finds the same filings, because every query here
+    matches titles case-insensitively.
+
+    ``min`` rather than a bare column, which SQLite permits and which returns an
+    arbitrary member. Arbitrary is not merely untidy here: it makes the tiebreak
+    in ``ORDER BY n DESC`` arbitrary too, so two titles filed the same number of
+    times can swap places between runs — and it made this query disagree with
+    the Azure port, which cannot write a bare column in a grouped select at all.
+    Ties are common once all 850,321 filings are loaded.
 
     ``None`` is treated as an empty prefix. A picker with nothing selected
     hands back ``None`` rather than ``""``, and the two mean the same thing
@@ -441,12 +448,12 @@ def title_search(
     """
     frame = _run(
         r"""
-        SELECT t.job_title, COUNT(*) AS n
+        SELECT min(t.job_title) AS job_title, COUNT(*) AS n
         FROM filings f
         JOIN titles t ON t.title_id = f.title_id
         WHERE t.job_title LIKE ? || '%' ESCAPE '\'
         GROUP BY lower(t.job_title)
-        ORDER BY n DESC, t.job_title
+        ORDER BY n DESC, min(t.job_title)
         LIMIT ?
         """,
         [_escape_like(_text("prefix", prefix) or ""), _whole_number("limit", limit)],

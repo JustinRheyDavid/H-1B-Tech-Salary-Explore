@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import struct
+import time
 import warnings
 from typing import Any
 
@@ -41,7 +42,7 @@ import pandas as pd
 
 from src import queries
 
-__all__ = ["AzureBackend", "connect", "server", "database"]
+__all__ = ["AzureBackend", "connect", "connect_awake", "server", "database"]
 
 # SQL_COPT_SS_ACCESS_TOKEN. Not exported by pyodbc, so the numeric constant is
 # the documented way to pass an Entra token through the ODBC driver.
@@ -63,9 +64,27 @@ _CI = "Latin1_General_CI_AS"
 # Resolved through the lookup table so the index on filings(title_id) applies,
 # exactly as Phase 1 does. Matching case-insensitively against the joined view
 # instead cost 156 ms where this costs 7 ms on SQLite.
+#
+# **Matched on key_exact, not on job_title, and that is not a micro-optimisation.**
+# SQL Server pads both operands to equal length before comparing, whatever the
+# collation, so `job_title = 'Software Engineer'` also matches 'Software Engineer'
+# with one, three, or twenty-five trailing spaces. SQLite does not pad. The two
+# backends therefore answered different questions: 71,780 filings against 70,943
+# for the same title, across twenty distinct spellings from 34 to 86 bytes.
+#
+# Step 8 built key_exact — job_title with a '.' appended — so that a trailing
+# space becomes an *interior* space, and interior spaces are never padding. It
+# was added to make the UNIQUE constraint work; it fixes the comparison for the
+# same reason. Appending the sentinel to the parameter too keeps the caller
+# passing a plain title.
+#
+# This did not show up at Step 8 because the seed was itself selected with
+# SQLite's exact semantics, so the trailing-space rows it would have swept in
+# were not in the database yet. It surfaced the moment Step 9 loaded all
+# 850,321 rows.
 _TITLE_MATCHES = (
     f"f.title_id IN (SELECT title_id FROM titles "
-    f"WHERE job_title COLLATE {_CI} = ?)"
+    f"WHERE key_exact COLLATE {_CI} = ? + N'.')"
 )
 
 # One median, as a window function over a partition.
@@ -131,6 +150,92 @@ def connect(server_name: str | None = None, database_name: str | None = None):
     return pyodbc.connect(connection_string, attrs_before={_TOKEN_ATTR: packed})
 
 
+#: How long a caller waits for a serverless resume, and how long between tries.
+#:
+#: The database has ``autoPauseDelay: 60``, so an idle hour puts it to sleep and
+#: the next connection is *refused* — ``Login timeout expired`` or ``Database ...
+#: is not currently available`` — while the resume runs behind it. Resuming takes
+#: tens of seconds.
+#:
+#: **This lives on the backend, not only in the ETL job.** An earlier version put
+#: the retry in ``src/etl/load_azure.py``, so the loader survived a resume and
+#: the dashboard did not: the first visitor after any quiet hour got a failure,
+#: and because :attr:`AzureBackend.TROUBLE` catches it, they saw an empty page
+#: rather than a slow one. Two minutes is chosen for a person waiting on a
+#: spinner; the ETL job asks for longer.
+RESUME_TIMEOUT = 120.0
+RESUME_WAIT = 10.0
+
+
+#: SQLSTATEs worth waiting on, and the only ones.
+#:
+#: **An allowlist, deliberately.** An earlier version caught ``pyodbc.Error``
+#: whole, and its docstring claimed a missing driver or a revoked role
+#: assignment was raised immediately. Both claims were false, because both
+#: arrive as ``pyodbc.Error``. Measured:
+#:
+#:     paused database / bad host   HYT00   retry
+#:     login failed, revoked grant  28000   fatal
+#:     missing ODBC driver          01000   fatal
+#:
+#: A revoked grant surfaces in 1.5 s as ``Login failed for user
+#: '<token-identified principal>'``. Catching it as retryable meant the caller
+#: waited the full timeout and was then told ``database did not resume`` — a
+#: wrong diagnosis of a permissions problem, and the exact failure a
+#: mis-granted managed identity produces in the container.
+#:
+#: ``HYT00`` cannot distinguish a resuming database from an unreachable host,
+#: so a wrong server name is waited on too. That is the acceptable half of the
+#: trade: it ends in a real error naming the SQLSTATE, rather than in silence.
+_RETRYABLE_SQLSTATES = frozenset({"HYT00", "08001", "08S01"})
+
+#: Error 40613, which arrives as text rather than a SQLSTATE of its own.
+_RESUMING = "is not currently available"
+
+
+def _is_resuming(exc: Exception) -> bool:
+    """Whether ``exc`` is worth waiting on rather than reporting."""
+    sqlstate = exc.args[0] if exc.args else ""
+    return sqlstate in _RETRYABLE_SQLSTATES or _RESUMING in str(exc)
+
+
+def connect_awake(
+    server_name: str | None = None,
+    database_name: str | None = None,
+    *,
+    timeout: float = RESUME_TIMEOUT,
+    wait: float = RESUME_WAIT,
+    echo=None,
+):
+    """:func:`connect`, but waiting out a serverless resume instead of failing.
+
+    Only the SQLSTATEs in :data:`_RETRYABLE_SQLSTATES` are waited on. Anything
+    else — a failed login, a missing driver, a bad token — is raised on the
+    first attempt, because retrying it merely delays a message the caller needs
+    now and then mislabels it.
+    """
+    import pyodbc
+
+    deadline = time.time() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return connect(server_name, database_name)
+        except pyodbc.Error as exc:
+            if not _is_resuming(exc):
+                raise
+            if time.time() >= deadline:
+                sqlstate = exc.args[0] if exc.args else "?"
+                raise RuntimeError(
+                    f"database did not resume within {timeout:.0f}s after "
+                    f"{attempt} attempts (SQLSTATE {sqlstate}): {exc}"
+                ) from exc
+            if echo:
+                echo(f"database asleep (attempt {attempt}); waiting {wait:.0f}s")
+            time.sleep(wait)
+
+
 def _escape_like(text: str) -> str:
     r"""Make ``text`` a literal prefix rather than a LIKE pattern.
 
@@ -192,7 +297,7 @@ class AzureBackend:
         fires on every single query — including once per keystroke in
         ``title_search``.
         """
-        connection = connect(self.server, self.database)
+        connection = connect_awake(self.server, self.database)
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings(
@@ -466,8 +571,17 @@ class AzureBackend:
         else, and the autocomplete would quietly stop working for most of what
         people type. This is the query that runs on every keystroke.
 
-        ``GROUP BY LOWER(job_title)`` cannot then select the bare column, so the
-        representative spelling is ``MIN``. Phase 1 lets SQLite pick arbitrarily
+        ``GROUP BY LOWER(key_exact)``, not ``LOWER(job_title)`` — the sentinel
+        again. Grouping on the bare column merges 'SOFTWARE ENGINEER' with
+        'SOFTWARE ENGINEER ' because the padded comparison makes them equal,
+        while SQLite keeps them apart; the picker then offered one entry where
+        Phase 1 offers two, and every entry below it shifted. That has to match
+        the filter: :data:`_TITLE_MATCHES` selects the exact spelling, so an
+        entry that silently stood for two spellings would return the filings of
+        only one of them.
+
+        The grouped select cannot name the bare column, so the representative
+        spelling is ``MIN``. Phase 1 lets SQLite pick arbitrarily
         from the group, so **the two backends can return different capitalisations
         of the same title** — a documented divergence, not a porting bug. Either
         spelling finds the same filings, because every query here matches titles
@@ -483,7 +597,7 @@ class AzureBackend:
             FROM filings f
             JOIN titles t ON t.title_id = f.title_id
             WHERE t.job_title COLLATE {_CI} LIKE ? + '%' ESCAPE '\'
-            GROUP BY LOWER(t.job_title)
+            GROUP BY LOWER(t.key_exact)
             ORDER BY n DESC, MIN(t.job_title)
             """,
             [

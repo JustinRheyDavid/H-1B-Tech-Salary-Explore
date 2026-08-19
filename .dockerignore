@@ -1,0 +1,29 @@
+# Keep the build context small and the image free of things it must not carry.
+#
+# data/ is the important line. It holds the 850 MB of DOL spreadsheets, their
+# Parquet caches and the 63 MB SQLite database — none of which belong in a
+# container that downloads its input from Blob. Without this line every image
+# build ships the entire dataset twice over.
+
+.git
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+
+data/
+notebooks/
+docs/
+tests/
+sql/
+infra/
+
+# Phase 1's dashboard and its config; Dockerfile.web brings its own.
+app.py
+.streamlit/
+
+*.md
+.gitignore
+.dockerignore
+Dockerfile*

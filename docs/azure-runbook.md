@@ -3,10 +3,12 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–8 done. Every value below was read from a live `az` command
-or a real SQL connection rather than transcribed. The rest of the data path
-(Step 9 onward) and teardown are still `<TO BE WRITTEN>`; any remaining
-`<FILL IN>` is a real blank, not a placeholder for something already known.
+**Status:** Steps 1–9 done, except the ETL **image**, which has never been built
+— see §4b. The load has run and Azure SQL holds all 850,321 filings. Every value
+in this file was read from a live `az` command or a real SQL connection rather
+than transcribed. Step 10 onward and teardown are still
+`<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real blank, not a placeholder
+for something already known.
 
 The build plan this follows is [`docs/plans/azure-migration.md`](plans/azure-migration.md).
 
@@ -1000,14 +1002,14 @@ spreadsheets costs ~15 minutes against seconds for the cache.
 #### Upload and inspect
 
 ```bash
-python -m src.etl.blob upload
+.venv/bin/python -m src.etl.blob upload
 ```
 
 Re-runnable: it skips blobs already present at the same size, so an interrupted
 upload resumes rather than restarting. `--force` overrides that.
 
 ```bash
-python -m src.etl.blob list
+.venv/bin/python -m src.etl.blob list
 ```
 
 Or through the CLI — note `--auth-mode login`, which forces the data plane onto
@@ -1289,6 +1291,228 @@ Two divergences are asserted as acceptable rather than fixed:
 - [x] `PERCENTILE_CONT` confirmed equal to Phase 1's interpolation
 - [x] 123,990 titles load with no rejections
 - [x] Schema script is re-runnable and asserts its own invariants
+
+---
+
+## 4b. Step 9 — load Azure SQL from Blob
+
+**Status: loaded 2026-08-18.** The row counts below were read from the database,
+not transcribed from the plan. The container image is the one part still
+PENDING.
+
+```
+LOADER  = src/etl/load_azure.py    download -> clean -> curated -> bulk insert
+IMAGE   = Dockerfile.etl           python:3.11-slim + msodbcsql18
+TESTS   = tests/test_load_azure.py 15 offline, 1 against the live database
+```
+
+### One definition of the data, two backends
+
+`src/load.py` grew `build_tables(cleaned)`: the frame-shaping and **every
+primary key**, in pure pandas with no database attached. Phase 1's SQLite
+writer and the Azure loader both call it.
+
+This is the part worth understanding. Every id is assigned by
+`range(len(values))` in Python, never by the database — which is why the T-SQL
+schema declares plain `INT` keys and asserts no `IDENTITY` column exists. Two
+loaders computing their own ids would not raise when they disagreed; they would
+attach the wrong employers to the right wages, and Step 8's equality tests would
+go on passing because both sides would be reading the same wrong ids.
+`tests/test_load_azure.py` compares `build_tables` against what the SQLite
+database actually stores, rather than against itself.
+
+`src/ingest.py` grew `combine(frames)` for the same reason. The container has
+the Parquet caches but no `.xlsx`, so it cannot call `load_all` — and `combine`
+is the half of `load_all` that resolves the 20,873 cases appearing in two files.
+A loader that concatenated without it would load 871,194 rows, and every count
+here would be wrong by the same amount.
+
+### The load replaces; it does not append
+
+Azure is **not empty**: Step 8 seeded the five lookups in full plus 70,949
+`Software Engineer` filings so the equality tests had something to compare. Since
+ids restart at 0 on every run, an append collides on the first row.
+
+`clear()` therefore empties everything first, children before parents:
+
+- `TRUNCATE TABLE dbo.filings` — allowed, because nothing references `filings`;
+  its foreign keys point outward.
+- `DELETE` for the five lookups — SQL Server refuses `TRUNCATE` on any table
+  named by a foreign key constraint *even when the referencing table is empty*.
+
+Verified against the live database, including that a rollback restores it: the
+probe cleared all six tables, inserted, then rolled back, and all 70,949 filings
+and 123,990 titles came back exactly.
+
+The whole write is one transaction. A failure partway through six tables would
+otherwise leave lookups from this run beside filings from the last — a state no
+row total would reveal, because the totals would look plausible and only the
+joins would be wrong.
+
+### The paused database is the expected failure, not an error
+
+`connect_awake()` retries for up to 5 minutes at 15-second intervals. The
+database is serverless with `autoPauseDelay: 60`, so the first connection after
+an idle hour is *refused* — `Login timeout expired` or `Database ... is not
+currently available` — while the resume happens behind it. This bit twice during
+Step 9's own development. Only connection errors are retried; a bad token or a
+missing driver is raised immediately, because retrying it for five minutes only
+delays a message the operator needs now.
+
+### Running it — done
+
+```bash
+.venv/bin/python -m src.etl.load_azure
+```
+
+**The venv path is not decoration.** `python` on macOS is the system 3.9, which
+has no pandas and is below this project's 3.11 floor; `python3 -m
+src.etl.load_azure` fails with `ModuleNotFoundError: No module named 'pandas'`,
+which reads like a missing dependency and is a wrong interpreter.
+
+Locally this authenticates as your `az login`; in the container it is the
+`h1b-etl` managed identity, and the code path is identical.
+
+**Acceptance criterion — met.** Counted twice, through pyodbc and again through
+`sqlcmd` unpiped so the exit code was real:
+
+| table | expected | actual |
+|---|---|---|
+| `filings` | 850,321 | **850,321** |
+| `employers` | 43,573 | **43,573** |
+| `titles` | 123,990 | **123,990** |
+| `locations` | 8,570 | **8,570** |
+| `occupations` | 63 | **63** |
+| `visa_classes` | 4 | **4** |
+
+Insert time was 270s of the run: `filings` 215.9s, `titles` 25.4s, `employers`
+27.1s, the rest under 2s each. The wall-clock figure the loader printed (4,826s)
+spans a machine suspend and is not a measure of anything.
+
+### What the full load exposed, and Step 8 could not have
+
+**The two backends were answering different questions, and every equality test
+passed anyway.** With all 850,321 rows loaded, 12 of the 16 Step 8 equality
+tests failed. The cause is the trailing-space padding from §8, resurfacing on
+the *query* side rather than the storage side:
+
+`job_title COLLATE Latin1_General_CI_AS = 'Software Engineer'` matches **twenty
+distinct spellings** in Azure — 34 to 86 bytes, differing only in case and
+trailing spaces — because SQL Server pads both operands before comparing.
+SQLite does not pad. Same title, **71,780 filings against 70,943**.
+
+This was invisible at Step 8 because the seed was itself selected with SQLite's
+exact semantics: the trailing-space rows the padded comparison would sweep in
+were not in the database yet. Only the full load could show it.
+
+Both fixes reuse `titles.key_exact`, the sentinel column built at Step 8 for the
+UNIQUE constraint — a trailing space becomes an interior space, and interior
+spaces are never padding:
+
+- `_TITLE_MATCHES` compares `key_exact = ? + N'.'`. Verified: 70,949 rows,
+  exactly SQLite's answer.
+- `title_search` groups on `LOWER(key_exact)`. Grouping on the bare column
+  merged `'SOFTWARE ENGINEER'` with `'SOFTWARE ENGINEER '`, so the picker
+  offered one entry where Phase 1 offers two and everything below it shifted.
+  This *has* to match the filter: an entry standing for two spellings would
+  return the filings of only one.
+
+One Phase 1 change came with it. `queries.title_search` selected a bare
+`job_title` while grouping on `lower(job_title)` — SQLite returns an arbitrary
+group member, which makes the `ORDER BY n DESC` tiebreak arbitrary too. It is
+`min(job_title)` now: deterministic between runs, and equal to the port.
+
+All 16 equality tests pass against the full dataset.
+
+`titles` is the number that proves the Step 8 collation fix held at full scale;
+`filings` is the number that proves `combine()` deduplicated. Both are asserted
+by `test_azure_holds_the_full_dataset`, which **skips** while the database still
+holds Step 8's 70,949-row seed rather than reporting a false pass.
+
+### Measured against the full dataset
+
+Query latency, warm, excluding the ~1.5 s a connection costs:
+
+| query | time |
+|---|---|
+| `salary_by_city` | **11.69 s** |
+| `top_employers` | 4.15 s |
+| `title_search` | 2.24 s |
+| `salary_percentiles` | 2.16 s |
+| `salary_trend` | 0.97 s |
+| `wage_distribution` | 0.41 s |
+
+**Step 8's open question, answered.** `sys.dm_db_index_usage_stats` after a
+representative set of queries:
+
+| index | seeks | scans |
+|---|---|---|
+| `idx_filings_title` | 16 | 6 |
+| `idx_filings_location` | 4 | 0 |
+| `uq_titles_key_exact` | 0 | 16 |
+| `idx_titles_job_title` | 0 | 2 |
+
+The two `filings` indexes and their `INCLUDE` lists earn their keep.
+`idx_titles_job_title` largely does not — 0 seeks, and the collation mismatch
+Step 8 predicted means it can never serve a seek. The title filter now runs
+through `uq_titles_key_exact` instead, which is the sentinel column's index.
+
+**So there is no cheap index fix for `salary_by_city`.** It is slow because of
+its shape — two CTEs, the second opening a window over every filing for the
+title — not because an index is missing. Speeding it up means rewriting the
+query, which belongs with Step 10 where the dashboard's caching is decided.
+
+### The paused database reaches the dashboard, not just the job
+
+`connect_awake` lives in `src/db/azure_impl.py` and `_run` uses it, so **both**
+the dashboard and the ETL job wait out a serverless resume. It was in the loader
+only at first, which meant the job survived a paused database and the dashboard
+did not: the first visitor after a quiet hour got a failure, and since
+`AzureBackend.TROUBLE` catches it, they saw an empty page rather than a slow one.
+Found by having it happen — a latency measurement crashed on exactly this.
+
+The backend waits 120 s (a person on a spinner); the ETL job asks for 300 s.
+Verified by injecting two refusals into the backend path: three attempts, then
+real data.
+
+**Only these SQLSTATEs are waited on.** The first version caught `pyodbc.Error`
+whole, which was wrong in a way that would have cost an evening:
+
+| failure | SQLSTATE | behaviour |
+|---|---|---|
+| paused database, unreachable host | `HYT00` | retry |
+| database resuming (error 40613) | *matched on message* | retry |
+| login failed, revoked role grant | `28000` | **fatal, 1.5 s** |
+| missing ODBC driver | `01000` | **fatal** |
+
+A revoked grant on the managed identity — the likeliest thing to go wrong when
+the ETL job first runs in its container — surfaces as `Login failed for user
+'<token-identified principal>'` in 1.5 seconds. Caught as retryable, it was
+waited on for the full timeout and then reported as `database did not resume`:
+a wrong diagnosis pointing at the wrong subsystem. Verified against the live
+server that it now raises in 1.5 s, and that a healthy connect is unaffected.
+
+`HYT00` cannot tell a resuming database from a wrong server name, so a typo in
+`AZURE_SQL_SERVER` is waited on too. That is the accepted half of the trade —
+it ends in an error naming the SQLSTATE rather than in silence.
+
+### Building and pushing the image — PENDING
+
+```bash
+docker build -f Dockerfile.etl -t ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest .
+docker push ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest
+az containerapp job update -g rg-h1b -n <job> --image ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest
+az containerapp job start -g rg-h1b -n <job>
+```
+
+GHCR paths must be lowercase; the repository's own capitalization does not
+survive into the image name.
+
+**This machine has no container runtime** — no Docker, no podman, no colima —
+so the image has never been built, and nothing in `Dockerfile.etl` beyond its
+syntax has been exercised. The Debian 12 / `bookworm` repository path in it is
+the one that matches `python:3.11-slim`; a `bullseye` path installs a driver
+that will not load.
 
 ---
 

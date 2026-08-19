@@ -118,11 +118,36 @@ def load_all(
     by ``DECISION_DATE`` makes "keep the later state" explicit rather than an
     accident of how the files happen to be named.
     """
-    needed = columns
-    if needed is not None:
-        needed = sorted(set(needed) | {"CASE_NUMBER", "DECISION_DATE"})
+    frames = [
+        load_raw(p, interim_dir, needed_columns(columns))
+        for p in source_files(raw_dir)
+    ]
+    return combine(frames)
 
-    frames = [load_raw(p, interim_dir, needed) for p in source_files(raw_dir)]
+
+def needed_columns(columns: list[str] | None) -> list[str] | None:
+    """``columns`` plus the two the deduplication itself needs.
+
+    Reading a narrower set than :func:`combine` requires fails inside pandas
+    with a ``KeyError`` on a column the caller never asked about.
+    """
+    if columns is None:
+        return None
+    return sorted(set(columns) | {"CASE_NUMBER", "DECISION_DATE"})
+
+
+def combine(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate source frames and resolve cases that appear in two of them.
+
+    Split out from :func:`load_all` so that a caller holding the Parquet caches
+    *without* the spreadsheets they were built from — the Azure ETL container,
+    which downloads the caches from Blob and never sees an ``.xlsx`` — gets this
+    exact logic rather than a second implementation of it.
+
+    That matters more than it looks: 20,873 cases appear twice, so a loader that
+    concatenated without this step would load 871,194 rows and every count in
+    the runbook would be wrong by the same amount.
+    """
     combined = pd.concat(frames, ignore_index=True)
     return (
         combined.sort_values(["CASE_NUMBER", "DECISION_DATE"])
