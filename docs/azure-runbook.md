@@ -3,8 +3,10 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–9 done, except the ETL **image**, which has never been built
-— see §4b. The load has run and Azure SQL holds all 850,321 filings. Every value
+**Status:** Steps 1–10 done in code, except **both container images**, which
+have never been built — this machine has no container runtime, so neither
+`Dockerfile.etl` nor `Dockerfile.web` has been exercised beyond its syntax and
+nothing has been deployed to Container Apps. See §4b and §4c. The load has run and Azure SQL holds all 850,321 filings. Every value
 in this file was read from a live `az` command or a real SQL connection rather
 than transcribed. Step 10 onward and teardown are still
 `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real blank, not a placeholder
@@ -1513,6 +1515,97 @@ so the image has never been built, and nothing in `Dockerfile.etl` beyond its
 syntax has been exercised. The Debian 12 / `bookworm` repository path in it is
 the one that matches `python:3.11-slim`; a `bullseye` path installs a driver
 that will not load.
+
+---
+
+## 4c. Step 10 — the dashboard on Azure SQL
+
+**Status: code done and verified locally against Azure SQL. Image PENDING.**
+
+```
+APP    = app.py                 unchanged layout, backend chosen by DB_BACKEND
+IMAGE  = Dockerfile.web         python:3.11-slim + msodbcsql18 + streamlit
+INFRA  = infra/containerapps.bicep   env vars + /_stcore/health readiness probe
+```
+
+### What actually changed in `app.py`
+
+The plan called this "a one-line change" and was corrected in place; the
+correction was right. Three things named SQLite and the third was the dangerous
+one:
+
+- The seven `_cache(queries.…)` wrappers now bind to `backend.…`.
+- `queries.DEFAULT_JOB_TITLE` → `backend.DEFAULT_JOB_TITLE`.
+- `DATABASE_TROUBLE` was `(FileNotFoundError, IsADirectoryError,
+  sqlite3.DatabaseError)`. **None of those catch `pyodbc.Error`**, so a paused
+  database or an expired token would have reached a visitor as a traceback. It
+  is `backend.TROUBLE` now, and `SQLiteBackend.TROUBLE` grew the two file errors
+  so the Phase 1 path keeps its readable message for a half-copied database.
+
+No chart, no layout and no copy changed. That was the return on Step 8's split.
+
+### Verified locally
+
+`tests/test_app.py` drives the real `app.py` through Streamlit's `AppTest` with
+`DB_BACKEND=azure`: the page renders with no error banner, and changing the city
+filter changes the metrics — which is what separates a working dashboard from
+one serving a cached first paint.
+
+| | |
+|---|---|
+| full page render, cold cache | **13.6 s** |
+| re-render, warm Streamlit cache | 0.1 s |
+| headline figures | `$142,146` median, 70,943 filings — identical to SQLite |
+
+### The 30-second cold-start budget is at risk
+
+The plan's acceptance criterion is a cold start from zero replicas in under 30
+seconds. It cannot be confirmed without building the image, but the parts that
+are measurable do not leave much room:
+
+| component | measured |
+|---|---|
+| container cold start (placeholder image) | 24.4 s |
+| first page render against Azure | 13.6 s |
+| serverless resume, if the database is asleep | tens of seconds |
+
+**`salary_by_city` alone is 11.7 s of that 13.6 s.** Step 9 established there is
+no index fix — the indexes are used, and the cost is the query's shape: two
+CTEs, the second opening a window over every filing for the title. If the budget
+is missed, that query is the lever, not the image size and not the CPU
+allocation.
+
+### A regression the move exposed
+
+The picker stopped opening on its default title. `title_search` groups spellings
+differing only by case and returns `min` of each group, and `'SOFTWARE ENGINEER'`
+sorts before `'Software Engineer'` — so `DEFAULT_JOB_TITLE in options` never
+matched on real data, fell through to index 0, and the page opened on whichever
+title was most filed. It looked correct because every test fixture holds one
+spelling per title. Matched case-folded now, with a fixture that has two
+spellings and a *different* title at index 0.
+
+### Deploying — PENDING
+
+```bash
+docker build -f Dockerfile.web -t ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest .
+docker push ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest
+```
+
+Then redeploy with the real image **and its port together** — `webTargetPort`
+must move from 80 to 8501 in the same deployment, which is why they are separate
+parameters with no defaults:
+
+```bash
+az deployment group create -g rg-h1b --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3   --template-file infra/main.bicep --parameters infra/main.parameters.json   --parameters webImage=ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest webTargetPort=8501
+```
+
+`DB_BACKEND`, `AZURE_SQL_SERVER` and `AZURE_SQL_DATABASE` are set on the
+container app by the template, and the readiness probe is attached — both only
+when `webTargetPort` is 8501, because the port-80 quickstart placeholder has no
+`/_stcore/health` and a probe against it restart-loops every container.
+
+`az deployment group what-if` succeeds against the current template.
 
 ---
 

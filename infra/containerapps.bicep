@@ -42,6 +42,12 @@ param webImage string
 @description('Port the web container listens on. MUST match webImage: 80 for the quickstart placeholder, 8501 for the real Streamlit image.')
 param webTargetPort int
 
+@description('Logical SQL server FQDN the dashboard connects to.')
+param sqlServerFqdn string
+
+@description('Database name the dashboard connects to.')
+param sqlDatabaseName string
+
 @description('Image for the ETL job. Placeholder until Step 9 builds the real one from Dockerfile.etl.')
 param etlImage string
 
@@ -60,6 +66,28 @@ param etlImage string
 // If Step 9's ODBC driver install proves hard to debug without retained logs
 // (plan §8 rates that risk medium-high), adding a workspace here is a small,
 // reversible change.
+// What the dashboard needs to find Azure SQL. No secret among them, and none
+// possible: the server has azureADOnlyAuthentication, so the h1b-web managed
+// identity IS the credential and there is no connection string to leak.
+//
+// DB_BACKEND is also baked into Dockerfile.web. Declared in both places on
+// purpose — the image must be correct when run by hand, and the container app
+// must be explicit about what it is running rather than inheriting it.
+var webEnvironment = webTargetPort == 8501 ? [
+  {
+    name: 'DB_BACKEND'
+    value: 'azure'
+  }
+  {
+    name: 'AZURE_SQL_SERVER'
+    value: sqlServerFqdn
+  }
+  {
+    name: 'AZURE_SQL_DATABASE'
+    value: sqlDatabaseName
+  }
+] : []
+
 resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: '${namePrefix}-env'
   location: location
@@ -131,6 +159,31 @@ resource webApp 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.5')
             memory: '1Gi'
           }
+          // Step 10. Empty while webImage is the quickstart placeholder, which
+          // ignores them; the real image reads both.
+          env: webEnvironment
+          // Streamlit's own endpoint. Without a readiness probe, Container Apps
+          // routes traffic as soon as the process binds the port, which for
+          // Streamlit is before the script has run — the first visitor after a
+          // scale-from-zero gets a blank page rather than a slow one.
+          //
+          // Only declared for the real image: the port-80 quickstart has no
+          // /_stcore/health, and a probe against it fails every container into
+          // a restart loop.
+          probes: webTargetPort == 8501 ? [
+            {
+              type: 'Readiness'
+              httpGet: {
+                path: '/_stcore/health'
+                port: 8501
+              }
+              // Generous: the container must import pandas and Streamlit, and
+              // the first query may be waiting out a serverless resume.
+              initialDelaySeconds: 10
+              periodSeconds: 10
+              failureThreshold: 6
+            }
+          ] : []
         }
       ]
       scale: {

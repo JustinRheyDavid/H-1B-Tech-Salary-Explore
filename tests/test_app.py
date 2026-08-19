@@ -409,3 +409,120 @@ def test_an_unusable_database_is_a_message_not_a_traceback(tmp_path, monkeypatch
     said = " ".join(messages(test)).lower()
     assert "database" in said
     assert "select" not in said, "the SQL leaked into the message"
+
+
+# --------------------------------------------------------------------------
+# The same page, against Azure SQL
+# --------------------------------------------------------------------------
+
+
+def test_it_opens_on_the_default_title_whatever_case_represents_it(tmp_path, monkeypatch):
+    """The picker names a title; it must open on that title, not near it.
+
+    ``title_search`` groups spellings differing only by case and returns ``min``
+    of the group — and 'SOFTWARE ENGINEER' sorts before 'Software Engineer', so
+    the representative spelling is the shouted one. An exact membership test
+    never matches on the real data: it falls through to index 0 and the page
+    opens on whichever title is most filed, which is the default only by luck.
+
+    Every other fixture in this file holds one spelling per title, which is
+    exactly why this went unnoticed until the dashboard ran against all 850,321
+    rows. Here the default is deliberately outnumbered by a title that would
+    otherwise take index 0.
+    """
+    shouted, other = 6, 14
+    rows = shouted + other
+    frame = pd.DataFrame(
+        {
+            **{k: [v] * rows for k, v in DEFAULTS.items()},
+            "CASE_NUMBER": [f"I-200-25001-{i:06d}" for i in range(1, rows + 1)],
+            # Two spellings of the default, so min() picks the uppercase one,
+            # and a different title filed more often than either.
+            "JOB_TITLE": (["SOFTWARE ENGINEER"] * 3 + ["Software Engineer"] * 3
+                          + ["Data Analyst"] * other),
+            "WORKSITE_CITY": ["austin"] * rows,
+            "WORKSITE_STATE": ["tx"] * rows,
+            "WAGE_RATE_OF_PAY_FROM": [float(90_000 + i * 1_000) for i in range(rows)],
+        }
+    )
+    path, _ = load.build(clean.clean(frame), tmp_path / "h1b.db")
+    monkeypatch.setattr(queries, "DB_PATH", path)
+
+    test = AppTest.from_file(APP, default_timeout=90)
+    test.run()
+
+    assert not test.exception, test.exception
+    opened_on = test.selectbox[0].value
+    assert opened_on.lower() == "software engineer", (
+        f"opened on {opened_on!r}; 'Data Analyst' is filed more often, so index 0 "
+        "is not the default"
+    )
+
+
+@pytest.mark.azure
+def test_the_page_renders_against_azure_sql(monkeypatch):
+    """Plan Step 10's acceptance criterion, minus the container.
+
+    The point of Step 8's interface split was that moving the dashboard to
+    Azure SQL would not touch its layout. This runs the *real* ``app.py`` —
+    same file, same charts, same copy — with ``DB_BACKEND=azure``, and asserts
+    it draws without an error banner and shows the full dataset rather than a
+    fixture.
+
+    Slow on purpose: seven live queries, one of which (``salary_by_city``) took
+    11.7 s measured against all 850,321 rows. If this ever needs a longer
+    timeout, that is the dashboard getting slower, not the test being flaky.
+    """
+    from conftest import require_module, unavailable
+
+    require_module("pyodbc", "ODBC driver not installed")
+    from src.db.azure_impl import connect_awake
+
+    try:
+        connect_awake(echo=lambda *_: None).close()
+    except Exception as exc:  # noqa: BLE001 - any failure means "cannot check"
+        unavailable(f"Azure SQL unreachable: {exc}")
+
+    monkeypatch.setenv("DB_BACKEND", "azure")
+    test = AppTest.from_file(APP, default_timeout=300)
+    test.run()
+
+    assert not test.exception, test.exception
+    assert not test.error, [e.value for e in test.error]
+
+    # Real data, not a fixture: the headline count is the whole dataset's
+    # Software Engineer slice, which no test database could produce.
+    metrics = [m.value for m in test.metric]
+    assert metrics, "the headline metrics did not draw"
+    opened_on = test.selectbox[0].value
+    assert opened_on.lower() == "software engineer", opened_on
+
+
+@pytest.mark.azure
+def test_a_filter_interaction_reaches_azure(monkeypatch):
+    """"Serves the page" is not the same as "the filters work".
+
+    Changing the city must re-query Azure and change the answer, which is what
+    separates a working dashboard from one rendering a cached first paint.
+    """
+    from conftest import require_module, unavailable
+
+    require_module("pyodbc", "ODBC driver not installed")
+    from src.db.azure_impl import connect_awake
+
+    try:
+        connect_awake(echo=lambda *_: None).close()
+    except Exception as exc:  # noqa: BLE001
+        unavailable(f"Azure SQL unreachable: {exc}")
+
+    monkeypatch.setenv("DB_BACKEND", "azure")
+    test = AppTest.from_file(APP, default_timeout=300)
+    test.run()
+    before = [m.value for m in test.metric]
+
+    _set(test, "City", "Seattle")
+    test.run()
+
+    assert not test.exception, test.exception
+    after = [m.value for m in test.metric]
+    assert after != before, "filtering by city changed nothing; the filter is inert"

@@ -19,9 +19,11 @@ tests/
 sql/
 infra/
 
-# Phase 1's dashboard and its config; Dockerfile.web brings its own.
-app.py
-.streamlit/
+# NOT excluded, and this bit is load-bearing: app.py and .streamlit/ were
+# listed here while Dockerfile.etl was the only image. Docker applies one
+# .dockerignore to every build in the context, so leaving them would have made
+# `COPY app.py .` in Dockerfile.web fail — or worse, silently ship the dashboard
+# without its theme. The ETL image simply does not COPY them.
 
 *.md
 .gitignore

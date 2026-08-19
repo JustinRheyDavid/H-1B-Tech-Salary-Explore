@@ -1,7 +1,7 @@
 """What tech jobs in the US actually pay, from H-1B wage filings.
 
-Layout and rendering only. Every number on the page comes from ``src.queries``
-and no SQL appears here — that separation is the point of the file split, and
+Layout and rendering only. Every number on the page comes from the backend
+``src.db.get_backend()`` returns, and no SQL appears here — that separation is the point of the file split, and
 it is the first thing a reviewer checks.
 
 Two rules this page is built around:
@@ -13,20 +13,31 @@ own frame before drawing.
 
 *A job title is always selected.* Unfiltered, the queries rank all 850,321
 rows and take over a second; with a title they answer in tens of milliseconds.
-The picker therefore starts on :data:`queries.DEFAULT_JOB_TITLE` and has no
+The picker therefore starts on :data:`backend.DEFAULT_JOB_TITLE` and has no
 empty state.
 """
 
 from __future__ import annotations
 
 import functools
-import sqlite3
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from src import load, queries
+from src.db import get_backend
+
+# Which database answers is a deployment decision, not a layout one.
+#
+# ``DB_BACKEND`` selects it: ``sqlite`` (the default, and what Streamlit Cloud
+# runs) or ``azure``. Nothing below this line names either one — that is the
+# whole return on Step 8's interface split, and it is why this file did not
+# need its charts rewritten to move to Azure SQL.
+#
+# Constructed at import, which is deliberate: a typo'd ``DB_BACKEND`` in a
+# container's environment raises here, on startup, instead of serving an empty
+# dashboard that says nothing about why.
+backend = get_backend()
 
 # Column formatting is declared to Streamlit rather than applied with pandas'
 # Styler: .style needs jinja2, which is not a dependency of this project, and
@@ -44,15 +55,15 @@ st.set_page_config(page_title="H-1B Tech Salary Explorer", page_icon="📊", lay
 # read-only and committed, so a cached answer can never go stale.
 _cache = st.cache_data(show_spinner=False)
 
-percentiles = _cache(queries.salary_percentiles)
-distribution = _cache(queries.wage_distribution)
-employers = _cache(queries.top_employers)
-by_city = _cache(queries.salary_by_city)
-trend = _cache(queries.salary_trend)
-titles = _cache(queries.title_search)
+percentiles = _cache(backend.salary_percentiles)
+distribution = _cache(backend.wage_distribution)
+employers = _cache(backend.top_employers)
+by_city = _cache(backend.salary_by_city)
+trend = _cache(backend.salary_trend)
+titles = _cache(backend.title_search)
 
 
-fiscal_years = _cache(queries.fiscal_years)
+fiscal_years = _cache(backend.fiscal_years)
 
 
 def _card(section):
@@ -110,15 +121,22 @@ def sidebar() -> dict:
     # Ordered by how often each title is filed, so the first entry is the one
     # most people want. An unmatched search leaves the previous title in place
     # rather than emptying the page.
-    options = titles(typed, 50) or [queries.DEFAULT_JOB_TITLE]
+    options = titles(typed, 50) or [backend.DEFAULT_JOB_TITLE]
     if typed and not titles(typed, 50):
         st.sidebar.caption(f"No titles start with “{typed}”. Showing the default.")
 
-    default = (
-        options.index(queries.DEFAULT_JOB_TITLE)
-        if queries.DEFAULT_JOB_TITLE in options
-        else 0
-    )
+    # Matched case-insensitively, because the spelling that represents a group
+    # is not the spelling written here. `title_search` groups titles that differ
+    # only by case and returns `min` of each group, and 'SOFTWARE ENGINEER'
+    # sorts before 'Software Engineer' — so an exact `in` check never matches on
+    # the real data, silently falls through to index 0, and the page opens on
+    # whatever happens to be most filed instead of on the title it names.
+    #
+    # It looked correct because the test fixtures hold one spelling per title.
+    # Either spelling selects the same filings, so only the picker was wrong.
+    folded = [option.lower() for option in options]
+    wanted = backend.DEFAULT_JOB_TITLE.lower()
+    default = folded.index(wanted) if wanted in folded else 0
     job_title = st.sidebar.selectbox("Job title", options, index=default)
 
     city = st.sidebar.text_input("City", placeholder="Austin").strip() or None
@@ -294,11 +312,19 @@ def footer() -> None:
     )
 
 
-# Every way the database can fail a reader. `load.connect` raises all of these
-# with a message that already says what to do, so they are shown as written
-# rather than translated. pandas wraps a failed query in its own DatabaseError
-# and pastes the SQL into the message, which is the one case worth replacing.
-DATABASE_TROUBLE = (FileNotFoundError, IsADirectoryError, sqlite3.DatabaseError)
+# Every way the database can fail a reader — named by the backend, not here.
+#
+# This was `(FileNotFoundError, IsADirectoryError, sqlite3.DatabaseError)`, and
+# hardcoding it was the single thing most likely to break the move to Azure:
+# **none of those catch `pyodbc.Error`**. A paused database, an expired token or
+# a dropped connection would each have escaped as an unhandled exception and
+# rendered a traceback to a visitor, on the exact path Phase 1 spent a commit
+# making readable.
+#
+# Each backend names its own, so the page stays correct under either. The
+# messages are shown as written: `load.connect` and `connect_awake` both raise
+# with text that already says what to do.
+DATABASE_TROUBLE = backend.TROUBLE
 
 
 def page() -> None:
@@ -339,9 +365,14 @@ def main() -> None:
         # — a clone that transferred the 78 MB database incompletely.
         st.error(f"The database cannot be read. {trouble}")
     except pd.errors.DatabaseError:
+        # pandas wraps a failed query in its own error and pastes the SQL into
+        # the message, which is the one case worth replacing rather than
+        # showing. Backend-neutral wording: under DB_BACKEND=azure there is no
+        # local file to rebuild.
         st.error(
-            "The database could not answer that query. It may be incomplete — "
-            "rebuild it with `python -m src.load`."
+            "The database could not answer that query. It may be incomplete or "
+            "still starting up — reload the page, and if it persists check the "
+            "runbook."
         )
 
 

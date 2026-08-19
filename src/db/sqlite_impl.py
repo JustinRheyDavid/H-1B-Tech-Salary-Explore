@@ -27,10 +27,20 @@ class SQLiteBackend:
 
     DEFAULT_JOB_TITLE = queries.DEFAULT_JOB_TITLE
 
-    # Phase 1's error path, unchanged. sqlite3.Error is the base of every
-    # exception the driver raises, so this catches a missing file, a corrupt
-    # database and a bad query alike.
-    TROUBLE: tuple[type[BaseException], ...] = (sqlite3.Error,)
+    # Phase 1's error path, and all of it.
+    #
+    # ``sqlite3.Error`` is the base of every exception the driver raises, but a
+    # missing or unopenable file never reaches the driver: ``load.connect``
+    # rejects it first with ``FileNotFoundError`` or ``IsADirectoryError``.
+    # ``app.py`` listed those separately while it imported sqlite3 directly. Now
+    # that it asks the backend instead, leaving them out would turn the failure
+    # a visitor is most likely to meet — a clone whose 78 MB database
+    # transferred incompletely — from a readable message back into a traceback.
+    TROUBLE: tuple[type[BaseException], ...] = (
+        sqlite3.Error,
+        FileNotFoundError,
+        IsADirectoryError,
+    )
 
     def __init__(self, db: Path | None = None) -> None:
         """``db=None`` means :data:`src.load.DB_PATH`, exactly as Phase 1 means it."""

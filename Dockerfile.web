@@ -1,0 +1,81 @@
+# The Streamlit dashboard, reading Azure SQL.
+#
+# Plan Step 10. Runs as a Container App with the h1b-web managed identity, which
+# holds db_datareader and nothing else — the dashboard cannot write even if a
+# query tried.
+#
+#   docker build -f Dockerfile.web -t ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest .
+#
+# GHCR paths must be lowercase; the repository's own capitalization does not
+# survive into the image name.
+
+FROM python:3.11-slim
+
+# The Microsoft ODBC driver, same as Dockerfile.etl and for the same reason:
+# pyodbc is a binding, not a driver, and without this every query fails with
+# "Can't open lib 'ODBC Driver 18 for SQL Server'" — SQLSTATE 01000, which
+# src/db/azure_impl.py treats as fatal rather than retrying, so it surfaces
+# immediately instead of after a two-minute wait.
+#
+# Debian 12 (bookworm) matches python:3.11-slim; the bullseye list installs a
+# driver that will not load.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl gnupg unixodbc \
+ && curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+      | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+      > /etc/apt/sources.list.d/mssql.list \
+ && apt-get update \
+ && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+ && apt-get purge -y curl gnupg \
+ && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# One requirements.txt, installed whole — the same call Dockerfile.etl makes,
+# for the same reason: a second pinned list is a second thing to keep in step.
+#
+# It costs more here than there, because this image cold-starts in front of a
+# person while the job's pull cost lands on nobody. openpyxl, pyarrow and
+# azure-storage-blob are never imported on this path — `src.load` only pulls
+# `ingest` inside `build()`, which the dashboard never calls. **If the 30-second
+# cold-start budget is missed, splitting them out is the first lever to try**,
+# and the second is that the driver install above is most of the image.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+COPY src/ ./src/
+# The theme from the end of Phase 1. Without it the page renders in Streamlit's
+# default colours and looks like a different application.
+COPY .streamlit/ ./.streamlit/
+
+# Unbuffered so Container Apps' log stream shows a failure as it happens rather
+# than when the process finally exits.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DB_BACKEND=azure
+
+# Declared here as well as on the container app. If this image is ever run
+# without DB_BACKEND set, defaulting to sqlite would make it look for a database
+# file that this image deliberately does not carry, and the dashboard would
+# report a missing file rather than an unconfigured backend.
+
+RUN useradd --create-home --uid 10001 web
+USER web
+
+EXPOSE 8501
+
+# Streamlit's own health endpoint, which the container app's probe also uses.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=4).status == 200 else 1)"
+
+# --server.address=0.0.0.0 because the default binds localhost, which is
+# unreachable from outside the container and produces a container that starts
+# cleanly and answers nothing.
+CMD ["streamlit", "run", "app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--browser.gatherUsageStats=false"]
