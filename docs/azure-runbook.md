@@ -1600,12 +1600,41 @@ parameters with no defaults:
 az deployment group create -g rg-h1b --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3   --template-file infra/main.bicep --parameters infra/main.parameters.json   --parameters webImage=ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest webTargetPort=8501
 ```
 
-`DB_BACKEND`, `AZURE_SQL_SERVER` and `AZURE_SQL_DATABASE` are set on the
-container app by the template, and the readiness probe is attached — both only
-when `webTargetPort` is 8501, because the port-80 quickstart placeholder has no
-`/_stcore/health` and a probe against it restart-loops every container.
+### Both containers are configured by the template, not by hardcoded names
 
-`az deployment group what-if` succeeds against the current template.
+Applied 2026-08-19 and read back from Azure:
+
+| container | variables |
+|---|---|
+| `h1b-web` | `DB_BACKEND`, `AZURE_SQL_SERVER`, `AZURE_SQL_DATABASE` |
+| `h1b-etl` | `AZURE_SQL_SERVER`, `AZURE_SQL_DATABASE`, `H1B_STORAGE_ACCOUNT` |
+
+**The ETL job had none of these.** It ran on the defaults hardcoded in
+`src/db/azure_impl.py` and `src/etl/blob.py`, which carry this deployment's
+random suffix — `sth1bhutymqa65yoty`, `sql-h1b-hutymqa65yoty`. Anyone
+redeploying into their own subscription would have got their own resources
+while the job pointed at these and failed on login. Step 12's criterion is that
+a stranger can redeploy from this runbook, so the job cannot depend on names
+that exist only here. The values now come from the SQL and storage module
+outputs.
+
+The env is set **unconditionally**. An earlier version made it conditional on
+`webTargetPort == 8501`, which tested a port to infer an image: deploy the real
+image and forget the port, and you got a container with no configuration and no
+probe — a silent misconfiguration rather than an error. The placeholder ignores
+variables it does not read, so there was nothing to guard against.
+
+Only the **readiness probe** stays conditional, and that one has to be: the
+port-80 quickstart has no `/_stcore/health`, and a probe against it restart-loops
+every container. Verified with `what-if` that the probe appears at
+`webTargetPort=8501` and not at 80.
+
+`az deployment group what-if` succeeds, and the deployment applied cleanly:
+2 modifies, no creates, no deletes.
+
+**Spend after Step 10: `0.0 CAD`** (budget `currentSpend`, which §3 gives as the
+reliable reading — `az consumption usage list` returned nothing at all this
+time, which is the preview behaviour §3 already warns about).
 
 ---
 

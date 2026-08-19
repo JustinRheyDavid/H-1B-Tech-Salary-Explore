@@ -120,6 +120,7 @@ module containerapps 'containerapps.bicep' = {
     // points at it — without an explicit dependsOn.
     sqlServerFqdn: sql.outputs.sqlServerFqdn
     sqlDatabaseName: sql.outputs.databaseName
+    storageAccountName: storage.outputs.storageAccountName
   }
 }
 

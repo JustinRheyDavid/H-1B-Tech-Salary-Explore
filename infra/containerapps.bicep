@@ -48,6 +48,9 @@ param sqlServerFqdn string
 @description('Database name the dashboard connects to.')
 param sqlDatabaseName string
 
+@description('Storage account the ETL job reads the DOL caches from.')
+param storageAccountName string
+
 @description('Image for the ETL job. Placeholder until Step 9 builds the real one from Dockerfile.etl.')
 param etlImage string
 
@@ -73,7 +76,14 @@ param etlImage string
 // DB_BACKEND is also baked into Dockerfile.web. Declared in both places on
 // purpose — the image must be correct when run by hand, and the container app
 // must be explicit about what it is running rather than inheriting it.
-var webEnvironment = webTargetPort == 8501 ? [
+// Set unconditionally. An earlier version made these conditional on
+// webTargetPort too, which tested a port to infer an image — deploy the real
+// image and forget the port and you got a container with no configuration and
+// no probe, a silent misconfiguration instead of an error. The quickstart
+// placeholder simply ignores variables it does not read, so there is nothing to
+// guard against. Only the probe still needs the condition, because a probe
+// against an endpoint the placeholder does not serve restart-loops it.
+var webEnvironment = [
   {
     name: 'DB_BACKEND'
     value: 'azure'
@@ -86,7 +96,32 @@ var webEnvironment = webTargetPort == 8501 ? [
     name: 'AZURE_SQL_DATABASE'
     value: sqlDatabaseName
   }
-] : []
+]
+
+// The ETL job needs the same two coordinates plus the storage account it reads
+// the DOL caches from.
+//
+// **It had none of these**, and relied on the defaults hardcoded in
+// src/db/azure_impl.py and src/etl/blob.py — which carry this deployment's
+// random suffix. Anyone redeploying into their own subscription would have got
+// their own storage account and SQL server while the job pointed at somebody
+// else's and failed on login. Step 12's whole criterion is that a stranger can
+// redeploy this from the runbook, so the job cannot depend on names that only
+// exist here.
+var etlEnvironment = [
+  {
+    name: 'AZURE_SQL_SERVER'
+    value: sqlServerFqdn
+  }
+  {
+    name: 'AZURE_SQL_DATABASE'
+    value: sqlDatabaseName
+  }
+  {
+    name: 'H1B_STORAGE_ACCOUNT'
+    value: storageAccountName
+  }
+]
 
 resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: '${namePrefix}-env'
@@ -159,8 +194,7 @@ resource webApp 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.5')
             memory: '1Gi'
           }
-          // Step 10. Empty while webImage is the quickstart placeholder, which
-          // ignores them; the real image reads both.
+          // Step 10.
           env: webEnvironment
           // Streamlit's own endpoint. Without a readiness probe, Container Apps
           // routes traffic as soon as the process binds the port, which for
@@ -232,6 +266,7 @@ resource etlJob 'Microsoft.App/jobs@2024-03-01' = {
         {
           name: 'etl'
           image: etlImage
+          env: etlEnvironment
           resources: {
             cpu: json('1.0')
             memory: '2Gi'
