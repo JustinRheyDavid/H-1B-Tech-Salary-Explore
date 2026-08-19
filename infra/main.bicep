@@ -113,6 +113,14 @@ module containerapps 'containerapps.bicep' = {
     webImage: webImage
     webTargetPort: webTargetPort
     etlImage: etlImage
+    // Passed rather than hardcoded in the app's environment: the FQDN carries a
+    // per-deployment random suffix, so anyone redeploying into their own
+    // subscription gets their own server without editing a container spec.
+    // Referencing the outputs also orders the modules — SQL before the app that
+    // points at it — without an explicit dependsOn.
+    sqlServerFqdn: sql.outputs.sqlServerFqdn
+    sqlDatabaseName: sql.outputs.databaseName
+    storageAccountName: storage.outputs.storageAccountName
   }
 }
 
