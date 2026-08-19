@@ -22,7 +22,7 @@ import pandas as pd
 import pytest
 
 from conftest import require_module
-from src import clean, ingest, load
+from src import clean, load
 from src.etl import load_azure
 
 # NOT a module-level pyodbc guard. Most of this file is pure pandas — the

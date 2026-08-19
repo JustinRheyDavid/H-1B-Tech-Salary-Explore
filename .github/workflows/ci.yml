@@ -1,0 +1,60 @@
+# Runs on every pull request. No Azure account, no credentials, no network.
+#
+# Plan Step 11. This is the workflow a contributor sees, so it must pass on a
+# fresh clone with nothing configured. `data/h1b.db` is committed, which is what
+# lets the query and app suites run here with no setup at all.
+#
+# `tests/test_pipeline_numbers.py` skips itself because `data/raw/` is
+# gitignored. That skip is correct here and is also the one that lets a wrong
+# Parquet cache through locally — see the runbook.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+# Read-only. This workflow has no business touching Azure or GHCR, and saying
+# so means a compromised dependency cannot either.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # pyodbc is a binding against libodbc.so.2. Without unixODBC the import
+      # fails, and `conftest.require_module` turns that into a *skip* — so the
+      # pyodbc-dependent offline tests would quietly stop running while the
+      # suite still went green. Installing it costs seconds and keeps them real.
+      - name: Install unixODBC so pyodbc imports
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends unixodbc
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Lint only, not `ruff format --check`. Formatting would reformat 16 of
+      # this repo's 24 files, and the comment layout it would rewrite is the
+      # substance of the codebase rather than incidental to it. Adopting the
+      # formatter is a deliberate change to make on its own, not a side effect
+      # of adding CI.
+      - name: Lint
+        run: ruff check .
+
+      # `not azure` because this job has no credentials by design. The live
+      # tests have their own workflow — see azure-tests.yml, and REQUIRE_AZURE
+      # in conftest.py for why they are not simply allowed to skip there.
+      - name: Test
+        run: pytest -q -m "not azure"

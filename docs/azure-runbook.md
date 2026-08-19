@@ -3,10 +3,11 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–10 done in code, except **both container images**, which
-have never been built — this machine has no container runtime, so neither
-`Dockerfile.etl` nor `Dockerfile.web` has been exercised beyond its syntax and
-nothing has been deployed to Container Apps. See §4b and §4c. The load has run and Azure SQL holds all 850,321 filings. Every value
+**Status:** Steps 1–11 done in code. **Both container images are still unbuilt**
+— this machine has no container runtime — but Step 11 hands that to GitHub
+Actions, so the first push to `main` is what builds and deploys them. Until that
+run happens, nothing in §4b's or §4c's deployment sections has been observed.
+One manual step remains before it can: the role assignment in §4d. The load has run and Azure SQL holds all 850,321 filings. Every value
 in this file was read from a live `az` command or a real SQL connection rather
 than transcribed. Step 10 onward and teardown are still
 `<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real blank, not a placeholder
@@ -1635,6 +1636,106 @@ every container. Verified with `what-if` that the probe appears at
 **Spend after Step 10: `0.0 CAD`** (budget `currentSpend`, which §3 gives as the
 reliable reading — `az consumption usage list` returned nothing at all this
 time, which is the preview behaviour §3 already warns about).
+
+---
+
+## 4d. Step 11 — CI and deployment from GitHub
+
+```
+.github/workflows/ci.yml           pull requests: ruff + pytest, no credentials
+.github/workflows/deploy.yml       push to main: build, push to GHCR, deploy
+.github/workflows/azure-tests.yml  on demand: the live suite, skips disabled
+```
+
+### There is no client secret, and that is the point
+
+Azure trusts a short-lived token GitHub mints for the workflow, exchanged
+through a federated credential. Created 2026-08-19:
+
+| | |
+|---|---|
+| app registration | `h1b-github-actions` |
+| client id | `47394bb2-60d0-459c-ba7c-563e015a9fe5` |
+| service principal object id | `3124dcef-610d-49e7-a075-348cc9863706` |
+| federated subject | `repo:JustinRheyDavid/H-1B-Tech-Salary-Explore:ref:refs/heads/main` |
+
+The subject is matched **exactly and case-sensitively**. A wrong slug fails at
+token exchange with `AADSTS700213`, which does not name the string it rejected —
+so it was taken from `gh repo view --json nameWithOwner` rather than typed.
+
+`gh variable list` holds the client, tenant and subscription ids; `gh secret
+list` is **empty**. None of those three is sensitive: they are useless without
+the federated trust, and that trust names this repository and this branch.
+
+### One manual step remains — PENDING
+
+The service principal has no permissions yet. Granting them was refused as a
+privilege escalation, so it has to be run by hand:
+
+```bash
+az role assignment create \
+  --assignee-object-id 3124dcef-610d-49e7-a075-348cc9863706 \
+  --assignee-principal-type ServicePrincipal \
+  --role Contributor \
+  --scope "/subscriptions/54d2e1cd-805a-4c5e-ac6f-25932378fcd3/resourceGroups/rg-h1b"
+```
+
+Scoped to the resource group, not the subscription. Until this runs, `deploy.yml`
+authenticates successfully and then fails on the deployment with an
+authorization error — the token exchange working is not the same as the
+principal being allowed to do anything.
+
+### What each workflow does
+
+**`ci.yml`** — pull requests and non-main pushes. `ruff check` and
+`pytest -m "not azure"`, with no credentials at all and `permissions:
+contents: read`. `data/h1b.db` is committed, so the query and app suites run
+with no setup. It installs `unixodbc` so `pyodbc` imports: without it
+`require_module` turns the failure into a *skip*, and the pyodbc-dependent
+offline tests would quietly stop running while the suite stayed green.
+
+Lint only — **not** `ruff format --check`. The formatter would rewrite 16 of the
+repo's 24 files, and the comment layout it would reflow is the substance of this
+codebase rather than incidental to it. Adopting it is a change to make
+deliberately, not as a side effect of adding CI. `ruff check` passes clean
+today; the single finding it had was an unused import added at Step 9.
+
+**`deploy.yml`** — push to `main`. Builds both images, pushes to GHCR, then one
+`az deployment group create` that moves `webImage`, `webTargetPort` **and**
+`etlImage` together. Images are tagged with the commit SHA and that is what
+deploys: Container Apps rolls a new revision when the image *reference* changes,
+so redeploying `:latest` over itself would leave the old revision serving and
+make "a commit to main rolls a new revision" quietly untrue.
+
+It then waits for `/_stcore/health` and **reports the cold start in the job
+summary** without failing on it. That is the plan's 30-second budget, measured
+at last — §4c predicted it would be missed, from 24.4 s of container start plus
+13.6 s of first render. A slow dashboard is a working dashboard, and failing the
+deploy would take away the fast fix, which is rolling back.
+
+**`azure-tests.yml`** — on demand. `REQUIRE_AZURE=1 pytest -m azure`, which is
+the decision recorded in §8: the live tests must not be free to skip in the one
+place built to run them. Kept out of `deploy.yml` so a slow query cannot turn a
+successful deployment red.
+
+> **Unverified, and stated rather than hidden.** The SQL firewall allows "Azure
+> services" (`0.0.0.0-0.0.0.0`) and no runner IP. GitHub-hosted runners execute
+> on Azure addresses, so this is *expected* to be admitted — but it has never
+> been observed from CI. If `azure-tests.yml` fails at connect with a firewall
+> error, that assumption is wrong, and the fix is a temporary rule for the
+> runner's egress IP, not a change to the tests.
+
+### The Bicep-to-code contract now has a test
+
+`tests/test_infra.py` asserts that the environment variable names
+`containerapps.bicep` writes are exactly the ones `src/` reads, that no
+deployment-specific literal (`sth1bhutymqa65yoty`, the SQL FQDN) is hardcoded in
+the template, and that no real IP address is committed in `sql.bicep`.
+
+Renaming a constant would otherwise stop the template configuring the container
+— which then falls back to the hardcoded default and **works on this
+deployment**, surfacing only for the stranger redeploying in Step 12. Verified
+the test bites: renaming `blob._ACCOUNT_ENV` fails it.
 
 ---
 
