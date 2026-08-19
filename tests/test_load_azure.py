@@ -304,20 +304,23 @@ def test_verify_refuses_a_short_load():
 
 
 def test_connect_awake_waits_out_a_resume(monkeypatch):
-    """The most likely reason this job fails, and it is not a fault."""
+    """The most likely reason this job fails, and it is not a fault.
+
+    Exercised through ``load_azure.connect_awake``, which is the backend's —
+    the retry moved to :mod:`src.db.azure_impl` so the dashboard gets it too.
+    """
     require_module("pyodbc", "ODBC driver not installed")
     import pyodbc
 
     attempts = {"n": 0}
 
-    def flaky():
+    def flaky(*_args):
         attempts["n"] += 1
         if attempts["n"] < 3:
             raise pyodbc.OperationalError("HYT00", "Login timeout expired")
         return "connection"
 
     monkeypatch.setattr("src.db.azure_impl.connect", flaky)
-    monkeypatch.setattr(load_azure.time, "sleep", lambda _: None)
 
     assert load_azure.connect_awake(wait=0, echo=lambda *_: None) == "connection"
     assert attempts["n"] == 3
@@ -327,11 +330,10 @@ def test_connect_awake_gives_up_and_says_what_it_waited_for(monkeypatch):
     require_module("pyodbc", "ODBC driver not installed")
     import pyodbc
 
-    def always_asleep():
+    def always_asleep(*_args):
         raise pyodbc.OperationalError("HYT00", "Login timeout expired")
 
     monkeypatch.setattr("src.db.azure_impl.connect", always_asleep)
-    monkeypatch.setattr(load_azure.time, "sleep", lambda _: None)
 
     with pytest.raises(RuntimeError, match="did not resume within"):
         load_azure.connect_awake(timeout=0, wait=0, echo=lambda *_: None)
@@ -340,7 +342,7 @@ def test_connect_awake_gives_up_and_says_what_it_waited_for(monkeypatch):
 def test_connect_awake_does_not_retry_a_real_failure(monkeypatch):
     """A missing driver or a revoked role must be reported now, not in 5 minutes."""
 
-    def broken():
+    def broken(*_args):
         raise ValueError("no credential")
 
     monkeypatch.setattr("src.db.azure_impl.connect", broken)
@@ -385,6 +387,4 @@ def test_azure_holds_the_full_dataset():
     finally:
         connection.close()
 
-    if actual["filings"] == 70_949:
-        unavailable("Azure still holds Step 8's seed; run 'python -m src.etl.load_azure'")
     assert actual == expected

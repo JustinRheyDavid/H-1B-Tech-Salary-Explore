@@ -1429,6 +1429,52 @@ All 16 equality tests pass against the full dataset.
 by `test_azure_holds_the_full_dataset`, which **skips** while the database still
 holds Step 8's 70,949-row seed rather than reporting a false pass.
 
+### Measured against the full dataset
+
+Query latency, warm, excluding the ~1.5 s a connection costs:
+
+| query | time |
+|---|---|
+| `salary_by_city` | **11.69 s** |
+| `top_employers` | 4.15 s |
+| `title_search` | 2.24 s |
+| `salary_percentiles` | 2.16 s |
+| `salary_trend` | 0.97 s |
+| `wage_distribution` | 0.41 s |
+
+**Step 8's open question, answered.** `sys.dm_db_index_usage_stats` after a
+representative set of queries:
+
+| index | seeks | scans |
+|---|---|---|
+| `idx_filings_title` | 16 | 6 |
+| `idx_filings_location` | 4 | 0 |
+| `uq_titles_key_exact` | 0 | 16 |
+| `idx_titles_job_title` | 0 | 2 |
+
+The two `filings` indexes and their `INCLUDE` lists earn their keep.
+`idx_titles_job_title` largely does not — 0 seeks, and the collation mismatch
+Step 8 predicted means it can never serve a seek. The title filter now runs
+through `uq_titles_key_exact` instead, which is the sentinel column's index.
+
+**So there is no cheap index fix for `salary_by_city`.** It is slow because of
+its shape — two CTEs, the second opening a window over every filing for the
+title — not because an index is missing. Speeding it up means rewriting the
+query, which belongs with Step 10 where the dashboard's caching is decided.
+
+### The paused database reaches the dashboard, not just the job
+
+`connect_awake` lives in `src/db/azure_impl.py` and `_run` uses it, so **both**
+the dashboard and the ETL job wait out a serverless resume. It was in the loader
+only at first, which meant the job survived a paused database and the dashboard
+did not: the first visitor after a quiet hour got a failure, and since
+`AzureBackend.TROUBLE` catches it, they saw an empty page rather than a slow one.
+Found by having it happen — a latency measurement crashed on exactly this.
+
+The backend waits 120 s (a person on a spinner); the ETL job asks for 300 s.
+Verified by injecting two refusals into the backend path: three attempts, then
+real data.
+
 ### Building and pushing the image — PENDING
 
 ```bash

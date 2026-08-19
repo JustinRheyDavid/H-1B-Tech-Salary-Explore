@@ -39,6 +39,7 @@ from pathlib import Path
 import pandas as pd
 
 from src import clean, ingest, load
+from src.db.azure_impl import connect_awake
 from src.etl import blob
 
 __all__ = [
@@ -51,13 +52,11 @@ __all__ = [
     "main",
 ]
 
-#: How long to keep retrying the first connection, and how long to wait between.
+#: The ETL job waits longer for a resume than a person on a spinner would.
 #:
-#: The database is serverless with ``autoPauseDelay: 60``, so an idle hour puts
-#: it to sleep and the next connection is *refused*, not queued — either
-#: ``Login timeout expired`` or ``Database ... is not currently available``.
-#: Resuming takes tens of seconds. A job that treats the first refusal as fatal
-#: fails every time it runs after a quiet night, which is most of the time.
+#: The retry itself lives on the backend — see
+#: :func:`src.db.azure_impl.connect_awake`. It was here first, which meant the
+#: loader survived a paused database and the dashboard did not.
 RESUME_TIMEOUT = 300.0
 RESUME_WAIT = 15.0
 
@@ -119,41 +118,6 @@ def write_curated(cleaned: pd.DataFrame, name: str = "filings_clean.parquet") ->
         local = Path(directory) / name
         cleaned.to_parquet(local, compression="snappy", index=False)
         return blob.upload_raw(local, container=blob.CURATED_CONTAINER)
-
-
-def connect_awake(
-    *, timeout: float = RESUME_TIMEOUT, wait: float = RESUME_WAIT, echo=print
-):
-    """Connect, waiting out a serverless resume rather than failing on it.
-
-    The paused database is the single most likely reason for this job to fail,
-    and it is not a fault: it is the mechanism keeping idle cost at zero. The
-    first connection after an idle hour is *refused* — ``Login timeout expired``
-    or ``Database ... is not currently available`` — while the resume happens
-    behind it, and the resume takes tens of seconds.
-
-    Retries only connection failures. Anything else — a bad token, a missing
-    driver, a revoked role assignment — is raised immediately, because retrying
-    it for five minutes only delays a message the operator needs now.
-    """
-    from src.db.azure_impl import connect
-
-    import pyodbc
-
-    deadline = time.time() + timeout
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            return connect()
-        except pyodbc.Error as exc:
-            if time.time() >= deadline:
-                raise RuntimeError(
-                    f"database did not resume within {timeout:.0f}s "
-                    f"after {attempt} attempts: {exc}"
-                ) from exc
-            echo(f"database asleep (attempt {attempt}); waiting {wait:.0f}s")
-            time.sleep(wait)
 
 
 def clear(cursor) -> None:
@@ -248,7 +212,7 @@ def run(
 
         tables = load.build_tables(cleaned)
 
-    connection = connect_awake(echo=echo)
+    connection = connect_awake(timeout=RESUME_TIMEOUT, wait=RESUME_WAIT, echo=echo)
     written: dict[str, int] = {}
     try:
         cursor = connection.cursor()

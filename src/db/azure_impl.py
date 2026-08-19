@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import struct
+import time
 import warnings
 from typing import Any
 
@@ -41,7 +42,7 @@ import pandas as pd
 
 from src import queries
 
-__all__ = ["AzureBackend", "connect", "server", "database"]
+__all__ = ["AzureBackend", "connect", "connect_awake", "server", "database"]
 
 # SQL_COPT_SS_ACCESS_TOKEN. Not exported by pyodbc, so the numeric constant is
 # the documented way to pass an Entra token through the ODBC driver.
@@ -149,6 +150,56 @@ def connect(server_name: str | None = None, database_name: str | None = None):
     return pyodbc.connect(connection_string, attrs_before={_TOKEN_ATTR: packed})
 
 
+#: How long a caller waits for a serverless resume, and how long between tries.
+#:
+#: The database has ``autoPauseDelay: 60``, so an idle hour puts it to sleep and
+#: the next connection is *refused* — ``Login timeout expired`` or ``Database ...
+#: is not currently available`` — while the resume runs behind it. Resuming takes
+#: tens of seconds.
+#:
+#: **This lives on the backend, not only in the ETL job.** An earlier version put
+#: the retry in ``src/etl/load_azure.py``, so the loader survived a resume and
+#: the dashboard did not: the first visitor after any quiet hour got a failure,
+#: and because :attr:`AzureBackend.TROUBLE` catches it, they saw an empty page
+#: rather than a slow one. Two minutes is chosen for a person waiting on a
+#: spinner; the ETL job asks for longer.
+RESUME_TIMEOUT = 120.0
+RESUME_WAIT = 10.0
+
+
+def connect_awake(
+    server_name: str | None = None,
+    database_name: str | None = None,
+    *,
+    timeout: float = RESUME_TIMEOUT,
+    wait: float = RESUME_WAIT,
+    echo=None,
+):
+    """:func:`connect`, but waiting out a serverless resume instead of failing.
+
+    Retries connection errors only. A bad token, a missing driver or a revoked
+    role assignment is raised immediately — retrying those for two minutes only
+    delays a message the caller needs now.
+    """
+    import pyodbc
+
+    deadline = time.time() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return connect(server_name, database_name)
+        except pyodbc.Error as exc:
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"database did not resume within {timeout:.0f}s "
+                    f"after {attempt} attempts: {exc}"
+                ) from exc
+            if echo:
+                echo(f"database asleep (attempt {attempt}); waiting {wait:.0f}s")
+            time.sleep(wait)
+
+
 def _escape_like(text: str) -> str:
     r"""Make ``text`` a literal prefix rather than a LIKE pattern.
 
@@ -210,7 +261,7 @@ class AzureBackend:
         fires on every single query — including once per keystroke in
         ``title_search``.
         """
-        connection = connect(self.server, self.database)
+        connection = connect_awake(self.server, self.database)
         try:
             with warnings.catch_warnings():
                 warnings.filterwarnings(
