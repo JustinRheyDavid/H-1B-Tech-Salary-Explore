@@ -109,6 +109,45 @@ jobs:
           echo "fqdn=$(cat fqdn.txt)" >> "$GITHUB_OUTPUT"
           echo "Deployed to https://$(cat fqdn.txt)"
 
+      # Before waiting on health, ask whether the revision even started.
+      #
+      # **The images are pulled from GHCR, which publishes packages private by
+      # default.** A private image cannot be pulled by Container Apps: the
+      # managed identity does not help, because GHCR does not accept Azure
+      # identities — only ACR does. The ARM deployment above still *succeeds*,
+      # because it validates the image reference rather than fetching it, and
+      # the revision then fails asynchronously on authorization.
+      #
+      # Without this step the next one runs 60 attempts over 300 seconds and
+      # reports "never returned 200 from /_stcore/health" — a message about
+      # health when the cause is a pull, which is the wrong subsystem and five
+      # minutes late. Same failure shape as retrying a permissions error as if
+      # it were a paused database.
+      #
+      # Fix if this fires: make both packages public (repo → Packages → package
+      # settings → visibility). Keeping them private would require a GHCR token
+      # in `registries.passwordSecretRef`, which reintroduces exactly the secret
+      # this workflow exists to avoid.
+      - name: Check the revision provisioned before blaming health
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            state=$(az containerapp revision list -g rg-h1b -n h1b-web \
+              --query "sort_by([], &properties.createdTime)[-1].properties.provisioningState" -o tsv)
+            echo "revision provisioningState: ${state}"
+            case "$state" in
+              Provisioned) exit 0 ;;
+              Failed)
+                echo "::error::The new revision failed to provision. If the images were"
+                echo "::error::just published, GHCR made them private and Container Apps"
+                echo "::error::cannot pull them. Make both packages public and re-run."
+                az containerapp logs show -n h1b-web -g rg-h1b --type system --tail 30 || true
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::warning::revision still not Provisioned after 300s; continuing to the health check"
+
       # The acceptance criterion, measured rather than assumed. minReplicas is
       # 0, so this request is a genuine cold start: image pull, Python import,
       # Streamlit boot, and possibly a serverless database resume behind it.
@@ -148,3 +187,12 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$url")
           [ "$code" = "200" ] || { echo "page returned $code"; exit 1; }
           echo "page served 200"
+
+      # Anything that got here and failed deserves the container's own account
+      # of it rather than a curl exit code.
+      - name: System logs, if something failed
+        if: failure()
+        run: |
+          az containerapp revision list -g rg-h1b -n h1b-web \
+            --query "[].{name:name,active:properties.active,state:properties.provisioningState,replicas:properties.replicas}" -o table || true
+          az containerapp logs show -n h1b-web -g rg-h1b --type system --tail 50 || true

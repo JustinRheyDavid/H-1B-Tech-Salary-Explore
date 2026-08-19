@@ -23,6 +23,13 @@
 # the fix is a temporary firewall rule for the runner's egress IP, not a change
 # to the tests.
 
+# **Dispatch this from `main` only.** The federated credential's subject is
+# pinned to `ref:refs/heads/main`, and for `workflow_dispatch` the OIDC subject
+# carries whichever branch it was dispatched on. Run it from a feature branch
+# and the token exchange fails with `AADSTS700213` — which, as above, does not
+# name the string it rejected, so the error reads like a broken credential
+# rather than a wrong branch.
+
 name: Azure tests
 
 on:

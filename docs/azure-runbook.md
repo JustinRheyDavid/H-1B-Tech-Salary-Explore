@@ -1667,7 +1667,7 @@ so it was taken from `gh repo view --json nameWithOwner` rather than typed.
 list` is **empty**. None of those three is sensitive: they are useless without
 the federated trust, and that trust names this repository and this branch.
 
-### One manual step remains — PENDING
+### Two manual steps remain — PENDING
 
 The service principal has no permissions yet. Granting them was refused as a
 privilege escalation, so it has to be run by hand:
@@ -1684,6 +1684,28 @@ Scoped to the resource group, not the subscription. Until this runs, `deploy.yml
 authenticates successfully and then fails on the deployment with an
 authorization error — the token exchange working is not the same as the
 principal being allowed to do anything.
+
+**2. Make both GHCR packages public, after the first push creates them.**
+
+repo → Packages → each package → Package settings → Change visibility → Public.
+
+GHCR publishes packages **private by default**, and a private image cannot be
+pulled by Container Apps. The managed identity does not help here: GHCR does not
+accept Azure identities, only ACR does. The ARM deployment still *succeeds*,
+because it validates the image reference rather than fetching it, and the
+revision then fails asynchronously on authorization.
+
+Keeping them private would mean a GHCR token in `registries.passwordSecretRef` —
+reintroducing exactly the secret this step exists to avoid. The images carry no
+data worth hiding: the ETL image downloads from Blob at runtime and the web
+image carries no database.
+
+`deploy.yml` checks the revision's `provisioningState` **before** waiting on
+health, and says this in the error if it fails. Without that check the health
+loop runs 60 attempts over 300 seconds and reports `never returned 200 from
+/_stcore/health` — a message about health when the cause is a pull, five minutes
+late and pointing at the wrong subsystem. The same misdiagnosis shape as
+retrying a permissions error as though it were a paused database.
 
 ### What each workflow does
 
@@ -1717,6 +1739,11 @@ deploy would take away the fast fix, which is rolling back.
 the decision recorded in §8: the live tests must not be free to skip in the one
 place built to run them. Kept out of `deploy.yml` so a slow query cannot turn a
 successful deployment red.
+
+`azure-tests.yml` must be **dispatched from `main`**: the federated subject is
+pinned to `ref:refs/heads/main`, and `workflow_dispatch` carries whichever branch
+it ran on, so a feature branch fails with `AADSTS700213` — an error that reads
+like a broken credential rather than a wrong branch.
 
 > **Unverified, and stated rather than hidden.** The SQL firewall allows "Azure
 > services" (`0.0.0.0-0.0.0.0`) and no runner IP. GitHub-hosted runners execute
