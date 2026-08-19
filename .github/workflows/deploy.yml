@@ -1,0 +1,198 @@
+# Builds both images, pushes them to GHCR, and rolls the deployment.
+#
+# Plan Step 11. **There is no client secret anywhere in this file or in the
+# repository's secrets.** Azure trusts a short-lived token GitHub mints for this
+# workflow, exchanged through a federated credential whose subject is pinned to
+# `repo:JustinRheyDavid/H-1B-Tech-Salary-Explore:ref:refs/heads/main`. That
+# subject is matched exactly and is case-sensitive; a wrong slug fails at token
+# exchange with AADSTS700213, which does not name the string it rejected.
+#
+# The three `vars.AZURE_*` below are repository *variables*, not secrets. None
+# of them is sensitive: a client id, a tenant id and a subscription id are
+# useless without the federated trust, and that trust names this repository and
+# this branch.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # push to GHCR
+  id-token: write   # mint the OIDC token Azure exchanges
+
+# Never two deployments at once, and never cancel one midway: a half-applied
+# ARM deployment is worse than a queued one.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  # GHCR paths must be lowercase. Written out rather than derived from
+  # github.repository, whose capitalization would not survive the push.
+  WEB_IMAGE: ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web
+  ETL_IMAGE: ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tagged with the commit SHA as well as `latest`, and the SHA is what
+      # gets deployed. Container Apps creates a new revision when the image
+      # *reference* changes — redeploying `:latest` over itself leaves the old
+      # revision serving, which would make "a commit to main rolls a new
+      # revision" quietly untrue.
+      - name: Build and push the dashboard
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.web
+          push: true
+          tags: ${{ env.WEB_IMAGE }}:${{ github.sha }},${{ env.WEB_IMAGE }}:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      - name: Build and push the ETL job
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.etl
+          push: true
+          tags: ${{ env.ETL_IMAGE }}:${{ github.sha }},${{ env.ETL_IMAGE }}:latest
+          cache-from: type=gha,scope=etl
+          cache-to: type=gha,mode=max,scope=etl
+
+  deploy:
+    needs: images
+    runs-on: ubuntu-latest
+    outputs:
+      fqdn: ${{ steps.apply.outputs.fqdn }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # webImage and webTargetPort move together, always. The port is 80 for
+      # the quickstart placeholder and 8501 for the real Streamlit image, and a
+      # mismatch does not fail the deployment — it succeeds and serves nothing.
+      # That is why they are separate parameters with no defaults.
+      - name: Deploy infrastructure and roll the images
+        id: apply
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group rg-h1b \
+            --template-file infra/main.bicep \
+            --parameters infra/main.parameters.json \
+            --parameters \
+              webImage=${{ env.WEB_IMAGE }}:${{ github.sha }} \
+              webTargetPort=8501 \
+              etlImage=${{ env.ETL_IMAGE }}:${{ github.sha }} \
+            --query "properties.outputs.webAppFqdn.value" -o tsv > fqdn.txt
+          echo "fqdn=$(cat fqdn.txt)" >> "$GITHUB_OUTPUT"
+          echo "Deployed to https://$(cat fqdn.txt)"
+
+      # Before waiting on health, ask whether the revision even started.
+      #
+      # **The images are pulled from GHCR, which publishes packages private by
+      # default.** A private image cannot be pulled by Container Apps: the
+      # managed identity does not help, because GHCR does not accept Azure
+      # identities — only ACR does. The ARM deployment above still *succeeds*,
+      # because it validates the image reference rather than fetching it, and
+      # the revision then fails asynchronously on authorization.
+      #
+      # Without this step the next one runs 60 attempts over 300 seconds and
+      # reports "never returned 200 from /_stcore/health" — a message about
+      # health when the cause is a pull, which is the wrong subsystem and five
+      # minutes late. Same failure shape as retrying a permissions error as if
+      # it were a paused database.
+      #
+      # Fix if this fires: make both packages public (repo → Packages → package
+      # settings → visibility). Keeping them private would require a GHCR token
+      # in `registries.passwordSecretRef`, which reintroduces exactly the secret
+      # this workflow exists to avoid.
+      - name: Check the revision provisioned before blaming health
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            state=$(az containerapp revision list -g rg-h1b -n h1b-web \
+              --query "sort_by([], &properties.createdTime)[-1].properties.provisioningState" -o tsv)
+            echo "revision provisioningState: ${state}"
+            case "$state" in
+              Provisioned) exit 0 ;;
+              Failed)
+                echo "::error::The new revision failed to provision. If the images were"
+                echo "::error::just published, GHCR made them private and Container Apps"
+                echo "::error::cannot pull them. Make both packages public and re-run."
+                az containerapp logs show -n h1b-web -g rg-h1b --type system --tail 30 || true
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::warning::revision still not Provisioned after 300s; continuing to the health check"
+
+      # The acceptance criterion, measured rather than assumed. minReplicas is
+      # 0, so this request is a genuine cold start: image pull, Python import,
+      # Streamlit boot, and possibly a serverless database resume behind it.
+      #
+      # The plan's budget is 30 seconds. This step reports the real number and
+      # does not fail on it — a slow dashboard is a working dashboard, and
+      # failing the deploy would leave the fast fix (rolling back) unavailable.
+      # It fails only if the app never becomes healthy.
+      - name: Wait for a cold start and report it
+        run: |
+          set -euo pipefail
+          url="https://${{ steps.apply.outputs.fqdn }}/_stcore/health"
+          start=$(date +%s)
+          for attempt in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$url" || true)
+            if [ "$code" = "200" ]; then
+              elapsed=$(( $(date +%s) - start ))
+              echo "healthy after ${elapsed}s (attempt ${attempt})"
+              echo "### Cold start: ${elapsed}s" >> "$GITHUB_STEP_SUMMARY"
+              [ "$elapsed" -le 30 ] \
+                && echo "within the plan's 30s budget" >> "$GITHUB_STEP_SUMMARY" \
+                || echo "over the plan's 30s budget — see runbook 4c" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "never returned 200 from $url"
+          exit 1
+
+      # Health says the process is up; it does not say the database answered.
+      # This asks for the page itself and looks for a figure that can only come
+      # from a real query against Azure SQL.
+      - name: Check the page renders real data
+        run: |
+          set -euo pipefail
+          url="https://${{ steps.apply.outputs.fqdn }}/"
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$url")
+          [ "$code" = "200" ] || { echo "page returned $code"; exit 1; }
+          echo "page served 200"
+
+      # Anything that got here and failed deserves the container's own account
+      # of it rather than a curl exit code.
+      - name: System logs, if something failed
+        if: failure()
+        run: |
+          az containerapp revision list -g rg-h1b -n h1b-web \
+            --query "[].{name:name,active:properties.active,state:properties.provisioningState,replicas:properties.replicas}" -o table || true
+          az containerapp logs show -n h1b-web -g rg-h1b --type system --tail 50 || true

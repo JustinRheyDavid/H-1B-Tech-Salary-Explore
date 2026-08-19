@@ -1,0 +1,85 @@
+# The live tests, with skipping disabled.
+#
+# Plan Step 11, and the home of the decision recorded in runbook §8: the 16
+# Azure SQL tests and the 4 storage tests skip when the driver is missing,
+# nobody is logged in, or the resource is unreachable. That is right for a
+# contributor and wrong for a job whose entire purpose is to exercise Azure —
+# a paused database or an expired federated credential would report success
+# while testing nothing.
+#
+# `REQUIRE_AZURE=1` turns every one of those skips into a failure. Verified
+# locally against an unreachable account: unset gives `16 passed, 4 skipped`
+# and exit 0; set gives errors and exit 1, with zero skips.
+#
+# **Separate from deploy.yml on purpose.** A deployment that succeeded should
+# not go red because a query got slow, and a failing live test should not
+# prevent the rollback that fixes it. This runs on demand.
+#
+# **Unverified assumption, stated rather than hidden:** the SQL server's
+# firewall allows "Azure services" (the 0.0.0.0-0.0.0.0 rule) and no explicit
+# runner IP. GitHub-hosted runners execute on Azure addresses, so this is
+# expected to be admitted — but it has never been observed from CI. If this
+# workflow fails at connect with a firewall error, that assumption is wrong and
+# the fix is a temporary firewall rule for the runner's egress IP, not a change
+# to the tests.
+
+# **Dispatch this from `main` only.** The federated credential's subject is
+# pinned to `ref:refs/heads/main`, and for `workflow_dispatch` the OIDC subject
+# carries whichever branch it was dispatched on. Run it from a feature branch
+# and the token exchange fails with `AADSTS700213` — which, as above, does not
+# name the string it rejected, so the error reads like a broken credential
+# rather than a wrong branch.
+
+name: Azure tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: azure-tests
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # The real driver, not just unixODBC: these tests connect. Same Debian
+      # repository the two Dockerfiles use, and the same reason — pyodbc is a
+      # binding, and without the driver every connection fails with SQLSTATE
+      # 01000, which src/db/azure_impl.py treats as fatal rather than retrying.
+      - name: Install the Microsoft ODBC driver
+        run: |
+          set -euo pipefail
+          curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
+          echo "deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/$(lsb_release -rs)/prod $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/mssql.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 unixodbc
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # DefaultAzureCredential picks up this session through AzureCliCredential,
+      # which is the same code path the container uses via managed identity.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run the live tests, skips disabled
+        env:
+          REQUIRE_AZURE: "1"
+        run: pytest -q -m azure
