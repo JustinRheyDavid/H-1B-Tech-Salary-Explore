@@ -167,6 +167,38 @@ RESUME_TIMEOUT = 120.0
 RESUME_WAIT = 10.0
 
 
+#: SQLSTATEs worth waiting on, and the only ones.
+#:
+#: **An allowlist, deliberately.** An earlier version caught ``pyodbc.Error``
+#: whole, and its docstring claimed a missing driver or a revoked role
+#: assignment was raised immediately. Both claims were false, because both
+#: arrive as ``pyodbc.Error``. Measured:
+#:
+#:     paused database / bad host   HYT00   retry
+#:     login failed, revoked grant  28000   fatal
+#:     missing ODBC driver          01000   fatal
+#:
+#: A revoked grant surfaces in 1.5 s as ``Login failed for user
+#: '<token-identified principal>'``. Catching it as retryable meant the caller
+#: waited the full timeout and was then told ``database did not resume`` — a
+#: wrong diagnosis of a permissions problem, and the exact failure a
+#: mis-granted managed identity produces in the container.
+#:
+#: ``HYT00`` cannot distinguish a resuming database from an unreachable host,
+#: so a wrong server name is waited on too. That is the acceptable half of the
+#: trade: it ends in a real error naming the SQLSTATE, rather than in silence.
+_RETRYABLE_SQLSTATES = frozenset({"HYT00", "08001", "08S01"})
+
+#: Error 40613, which arrives as text rather than a SQLSTATE of its own.
+_RESUMING = "is not currently available"
+
+
+def _is_resuming(exc: Exception) -> bool:
+    """Whether ``exc`` is worth waiting on rather than reporting."""
+    sqlstate = exc.args[0] if exc.args else ""
+    return sqlstate in _RETRYABLE_SQLSTATES or _RESUMING in str(exc)
+
+
 def connect_awake(
     server_name: str | None = None,
     database_name: str | None = None,
@@ -177,9 +209,10 @@ def connect_awake(
 ):
     """:func:`connect`, but waiting out a serverless resume instead of failing.
 
-    Retries connection errors only. A bad token, a missing driver or a revoked
-    role assignment is raised immediately — retrying those for two minutes only
-    delays a message the caller needs now.
+    Only the SQLSTATEs in :data:`_RETRYABLE_SQLSTATES` are waited on. Anything
+    else — a failed login, a missing driver, a bad token — is raised on the
+    first attempt, because retrying it merely delays a message the caller needs
+    now and then mislabels it.
     """
     import pyodbc
 
@@ -190,10 +223,13 @@ def connect_awake(
         try:
             return connect(server_name, database_name)
         except pyodbc.Error as exc:
+            if not _is_resuming(exc):
+                raise
             if time.time() >= deadline:
+                sqlstate = exc.args[0] if exc.args else "?"
                 raise RuntimeError(
-                    f"database did not resume within {timeout:.0f}s "
-                    f"after {attempt} attempts: {exc}"
+                    f"database did not resume within {timeout:.0f}s after "
+                    f"{attempt} attempts (SQLSTATE {sqlstate}): {exc}"
                 ) from exc
             if echo:
                 echo(f"database asleep (attempt {attempt}); waiting {wait:.0f}s")

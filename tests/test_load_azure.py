@@ -339,8 +339,40 @@ def test_connect_awake_gives_up_and_says_what_it_waited_for(monkeypatch):
         load_azure.connect_awake(timeout=0, wait=0, echo=lambda *_: None)
 
 
-def test_connect_awake_does_not_retry_a_real_failure(monkeypatch):
-    """A missing driver or a revoked role must be reported now, not in 5 minutes."""
+@pytest.mark.parametrize(
+    "sqlstate, message",
+    [
+        ("28000", "Login failed for user '<token-identified principal>'"),
+        ("01000", "Can't open lib 'ODBC Driver 18 for SQL Server'"),
+    ],
+)
+def test_connect_awake_does_not_retry_a_fatal_failure(monkeypatch, sqlstate, message):
+    """The boundary this function exists to draw, tested where it actually is.
+
+    An earlier version of this test raised ``ValueError``, which was never a
+    ``pyodbc.Error`` and so passed no matter what the retry filter did — it
+    tested nothing. Both SQLSTATEs below *are* ``pyodbc.Error``, which is why
+    catching that class whole was wrong: a revoked role assignment (28000,
+    raised in 1.5 s) was waited on for the full timeout and then reported as
+    ``database did not resume``.
+    """
+    require_module("pyodbc", "ODBC driver not installed")
+    import pyodbc
+
+    attempts = {"n": 0}
+
+    def fatal(*_args):
+        attempts["n"] += 1
+        raise pyodbc.Error(sqlstate, message)
+
+    monkeypatch.setattr("src.db.azure_impl.connect", fatal)
+    with pytest.raises(pyodbc.Error, match=sqlstate):
+        load_azure.connect_awake(wait=0, echo=lambda *_: None)
+    assert attempts["n"] == 1, "a fatal failure must not be retried"
+
+
+def test_connect_awake_does_not_retry_a_credential_failure(monkeypatch):
+    """A bad token never reaches pyodbc — it fails while fetching the token."""
 
     def broken(*_args):
         raise ValueError("no credential")
@@ -348,6 +380,21 @@ def test_connect_awake_does_not_retry_a_real_failure(monkeypatch):
     monkeypatch.setattr("src.db.azure_impl.connect", broken)
     with pytest.raises(ValueError, match="no credential"):
         load_azure.connect_awake(echo=lambda *_: None)
+
+
+def test_a_resuming_database_is_recognised_by_its_message():
+    """Error 40613 arrives as text, not as a SQLSTATE of its own."""
+    require_module("pyodbc", "ODBC driver not installed")
+    import pyodbc
+
+    from src.db.azure_impl import _is_resuming
+
+    assert _is_resuming(pyodbc.Error("HYT00", "Login timeout expired"))
+    assert _is_resuming(
+        pyodbc.Error("42000", "Database 'sqldb-h1b' is not currently available")
+    )
+    assert not _is_resuming(pyodbc.Error("28000", "Login failed for user"))
+    assert not _is_resuming(pyodbc.Error("01000", "Can't open lib"))
 
 
 # --------------------------------------------------------------------------

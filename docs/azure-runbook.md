@@ -1475,6 +1475,27 @@ The backend waits 120 s (a person on a spinner); the ETL job asks for 300 s.
 Verified by injecting two refusals into the backend path: three attempts, then
 real data.
 
+**Only these SQLSTATEs are waited on.** The first version caught `pyodbc.Error`
+whole, which was wrong in a way that would have cost an evening:
+
+| failure | SQLSTATE | behaviour |
+|---|---|---|
+| paused database, unreachable host | `HYT00` | retry |
+| database resuming (error 40613) | *matched on message* | retry |
+| login failed, revoked role grant | `28000` | **fatal, 1.5 s** |
+| missing ODBC driver | `01000` | **fatal** |
+
+A revoked grant on the managed identity — the likeliest thing to go wrong when
+the ETL job first runs in its container — surfaces as `Login failed for user
+'<token-identified principal>'` in 1.5 seconds. Caught as retryable, it was
+waited on for the full timeout and then reported as `database did not resume`:
+a wrong diagnosis pointing at the wrong subsystem. Verified against the live
+server that it now raises in 1.5 s, and that a healthy connect is unaffected.
+
+`HYT00` cannot tell a resuming database from a wrong server name, so a typo in
+`AZURE_SQL_SERVER` is waited on too. That is the accepted half of the trade —
+it ends in an error naming the SQLSTATE rather than in silence.
+
 ### Building and pushing the image — PENDING
 
 ```bash
