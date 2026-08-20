@@ -109,6 +109,41 @@ def test_ci_skips_the_role_assignment_it_cannot_write():
     assert "assignRoles=false" in DEPLOY.read_text()
 
 
+RUNBOOK = Path(__file__).resolve().parent.parent / "docs" / "azure-runbook.md"
+README = Path(__file__).resolve().parent.parent / "README.md"
+
+
+def test_the_runbook_only_tells_a_stranger_to_run_files_that_exist():
+    """§6 is Step 12's acceptance criterion: someone else follows it and succeeds.
+
+    They cannot, if it names a file that has been renamed since it was written.
+    A runbook is the one document nobody re-reads until they urgently need it to
+    be right, and every path below is a step that stops the walkthrough dead.
+    """
+    runbook = RUNBOOK.read_text()
+    root = RUNBOOK.parent.parent
+    # Named by basename, because the runbook writes `sql.bicep` in prose and
+    # `infra/main.bicep` in commands, and both are the same claim.
+    referenced = ["sql/schema_azure.sql", "sql/grant_identities.sql",
+                  "infra/main.bicep", "infra/main.parameters.json",
+                  "infra/sql.bicep", "infra/storage.bicep",
+                  "src/etl/blob.py", "src/etl/load_azure.py"]
+    for path in referenced:
+        name = Path(path).name
+        assert name in runbook, (
+            f"{name} is no longer mentioned in the runbook — if it moved, §6 moved with it"
+        )
+        assert (root / path).exists(), (
+            f"the runbook tells you to run {path}, which does not exist"
+        )
+
+
+def test_the_readme_does_not_leak_the_home_ip():
+    """The README is the most-read file here and the least likely to be audited."""
+    addresses = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", README.read_text()))
+    assert addresses <= {"0.0.0.0"}, f"real IP addresses in README.md: {addresses}"
+
+
 def test_the_home_ip_is_not_committed():
     """A home IP address does not belong in a public repository.
 

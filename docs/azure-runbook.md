@@ -3,15 +3,17 @@
 Operational notes for the Azure deployment (Phase 2). How to stand it up, how to
 check what it costs, and how to tear it down.
 
-**Status:** Steps 1–11 done in code. **Both container images are still unbuilt**
-— this machine has no container runtime — but Step 11 hands that to GitHub
-Actions, so the first push to `main` is what builds and deploys them. Until that
-run happens, nothing in §4b's or §4c's deployment sections has been observed.
-One manual step remains before it can: the role assignment in §4d. The load has run and Azure SQL holds all 850,321 filings. Every value
-in this file was read from a live `az` command or a real SQL connection rather
-than transcribed. Step 10 onward and teardown are still
-`<TO BE WRITTEN>`; any remaining `<FILL IN>` is a real blank, not a placeholder
-for something already known.
+**Status: all twelve steps done, and running.** The dashboard serves from Azure
+Container Apps against Azure SQL; the ETL job loads all 850,321 filings from its
+own container; a push to `main` builds both images and rolls the deployment with
+no secret anywhere. Spend is `0.00 CAD`.
+
+Every value in this file was read from a live `az` command, a real SQL
+connection, or a container log — not transcribed from the plan. Where something
+has **not** been observed it says so in those words, and §9's teardown command is
+the one thing here that has never been run, for the obvious reason. Any
+remaining `<FILL IN>` is a real blank rather than a placeholder for something
+already known.
 
 The build plan this follows is [`docs/plans/azure-migration.md`](plans/azure-migration.md).
 
@@ -2158,9 +2160,291 @@ DDL before the first load, not in a retry. See plan §6.
 
 ---
 
-## 6. Teardown
+## 6. Deploying this into your own subscription
 
-<!-- Step 12. The one command that removes everything. Not verified yet — do not
-     write it here until it has actually been run. -->
+This is Step 12's acceptance criterion: a stranger, in their own Azure account,
+following this section and ending up with a working dashboard. It is a
+walkthrough rather than a re-explanation — each step links to the section that
+already covers it.
 
-`<TO BE WRITTEN>`
+**What it costs: nothing**, if you stay on the same SKUs. §2 explains why, and
+§8 is what to do if that turns out to be wrong on your account.
+
+### Before you start
+
+1. A **personal** Microsoft account, not a school or work one — §1 explains why
+   this matters more than it sounds like it should.
+2. `az`, and `az login`. If you have more than one subscription, note its ID
+   now: **pin `--subscription` by ID on every command, never by name.** Two of
+   the subscriptions on this account are both called "Azure subscription 1".
+3. A GitHub account, and a fork of the repository.
+
+### The parts nobody can automate
+
+Three things need a human, and they are the three most likely to be skipped:
+
+| | |
+|---|---|
+| The **Entra admin** on the SQL server | Azure SQL has `azureADOnlyAuthentication: true`. There is no password. Someone has to be named the admin before anything can connect. |
+| `sql/grant_identities.sql` | Database users live *inside* the database, not in ARM. Bicep cannot express them. Run it as the Entra admin after the first deployment, and again if the database is ever dropped. |
+| The **firewall rule for your own IP** | `sql.bicep` takes it as a parameter defaulting to empty, and `tests/test_infra.py` asserts no real address is committed. Add yours out of band. |
+
+§4's Step 4 and Step 6 sections carry the exact commands.
+
+### The sequence
+
+```bash
+az group create -n rg-h1b -l canadacentral --subscription <YOUR-SUBSCRIPTION-ID>
+```
+
+```bash
+az deployment group create -g rg-h1b --subscription <YOUR-SUBSCRIPTION-ID>   --template-file infra/main.bicep --parameters infra/main.parameters.json   --parameters webImage=mcr.microsoft.com/azuredocs/containerapps-helloworld:latest webTargetPort=80 etlImage=mcr.microsoft.com/azuredocs/containerapps-helloworld:latest
+```
+
+The placeholder images come first because `webImage` has no default and your own
+images do not exist yet. **`webTargetPort` moves with `webImage`, always** — 80
+for the placeholder, 8501 for the real Streamlit image. A mismatch does not fail
+the deployment; it succeeds and serves nothing.
+
+Note there is **no `assignRoles` here**. It defaults to `true`, which is the
+whole point of the default: you are deploying as your own owner-level account,
+so the ETL job's blob grant gets created. Only CI passes `false` — §4d explains
+why, and what that leaves you to do by hand.
+
+Then, in order:
+
+1. **Name yourself the SQL Entra admin**, add your IP to the firewall, and run
+   `sql/grant_identities.sql`. Nothing below works until this is done, and the
+   failure it produces — `Login failed for user '<token-identified principal>'`
+   — reads like a broken credential rather than a missing grant. §5.
+2. **Create the schema:** `sqlcmd -S <your-server>.database.windows.net -d sqldb-h1b -G -i sql/schema_azure.sql`.
+3. **Upload the raw caches:** `.venv/bin/python -m src.etl.blob upload`. Your own
+   account needs Storage Blob Data Contributor on the storage account to do this
+   — the deployment does not grant it to you, only to the ETL job. §4's Step 7
+   prerequisite.
+4. **Set up CI**, or skip it and deploy by hand. §4d has the app registration,
+   the federated credentials, and the three repository *variables* (not secrets).
+   If you skip it, build and push the two images yourself and redeploy with the
+   real `webImage`/`webTargetPort`/`etlImage`.
+5. **Load the data:** `az containerapp job start -g rg-h1b -n h1b-etl`. Expect
+   about three minutes. §4b has the timings and the row counts to check against.
+
+### What will be different on your account, by design
+
+Storage accounts and SQL servers need globally unique names, so `main.bicep`
+derives a suffix from the resource group's ID. **Yours will not be
+`hutymqa65yoty`.** Nothing should need editing for that: the FQDN and the
+storage account name are passed into both containers as environment variables
+from module outputs, and `tests/test_infra.py` fails if anyone hardcodes them
+back. That test exists precisely for this section — a hardcoded name works
+perfectly here and silently points your job at somebody else's resources.
+
+---
+
+## 7. Refreshing the data with a new DOL quarter
+
+The DOL publishes one file per fiscal quarter. Adding one is four commands and
+one gotcha.
+
+```bash
+# 1. Download the new LCA_Disclosure_Data_FY20XX_QX.xlsx into data/raw/
+#    from https://www.dol.gov/agencies/eta/foreign-labor/performance
+```
+
+```bash
+# 2. Convert it to Parquet alongside the others (also rebuilds the SQLite db)
+.venv/bin/python -m src.load
+```
+
+```bash
+# 3. Push the caches to Blob
+.venv/bin/python -m src.etl.blob upload
+```
+
+```bash
+# 4. Reload Azure SQL from them
+az containerapp job start -g rg-h1b -n h1b-etl --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+**The load replaces; it does not append.** `clear()` TRUNCATEs `filings` and
+DELETEs every lookup before inserting, so step 4 must follow step 3 — running
+the job against a stale `raw/` rewrites the database with *less* data than it
+had, and every row count will still look plausible. §4b.
+
+### The gotcha: `raw/` empties itself every 90 days
+
+`storage.bicep` sets a lifecycle rule deleting blobs under `raw/` after 90 days,
+which is what keeps storage in the free tier. So:
+
+- If it has been three months since the last upload, **step 3 is not optional**,
+  and `download_caches` will fail with a message saying exactly this rather than
+  loading nothing.
+- `tests/test_raw_holds_exactly_the_nine_dol_caches` starts failing when that
+  happens. It is not a broken test; it is the rule working. Re-upload.
+
+### Why the job trigger is still `Manual`
+
+Plan Step 12 offers a scheduled trigger — cron `0 6 1 * *`, monthly — as an
+optional extra. It is one property in `containerapps.bicep` and it is
+deliberately not set.
+
+A monthly run would reload the database from whatever is in `raw/`, and the
+lifecycle rule empties `raw/` after 90 days. So the schedule would do nothing
+useful for two months (reloading identical data over itself, TRUNCATE and all),
+and then fail every month after that — a permanently red job that is *correct*
+to be red, which is the worst kind of alert to own. The DOL publishes quarterly
+and the upload is manual anyway, so the trigger matches the cadence of the thing
+that actually changes.
+
+Set it when the upload is automated too, not before:
+
+```bicep
+triggerType: 'Schedule'
+scheduleTriggerConfig: { cronExpression: '0 6 1 * *' }
+```
+
+### Numbers that are pinned to the current data
+
+Adding a quarter changes the row counts, so these need updating together:
+
+| where | what |
+|---|---|
+| `README.md` | "850,321 wage figures" in the opening line |
+| `app.py:356` | the caption under the title — **hardcoded, not queried** |
+| `docs/azure-runbook.md` §4b | the six row counts |
+| `tests/test_load_azure.py` | the live count assertions |
+
+That `app.py` caption is worth singling out. It looks like a query result and is
+not one, and a stale value there is invisible — it cost this project a wrong
+"the dashboard is fine" twice while the page was in fact showing a database
+error, because the number underneath it was read as evidence the database had
+answered.
+
+---
+
+## 8. If the budget alert fires
+
+The budget is `h1b-zero-spend`, subscription-scoped, **1.00 CAD** with
+notifications at 50%, 80% and 100%. Firing at all means something is wrong,
+because the intended steady state is exactly zero.
+
+### First, find out what is actually costing money
+
+```bash
+az consumption budget show --budget-name h1b-zero-spend --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 --query "currentSpend" -o json
+```
+
+That is the fastest answer but not a breakdown. §3 has the Cost Management query
+that itemizes by resource, and explains why `az consumption usage list` returns
+nothing here and should not be trusted.
+
+### The three ways this becomes non-zero
+
+§3 covers these in detail. In descending order of likelihood:
+
+1. **The Azure SQL free offer ran out or was never applied.** It grants 100,000
+   vCore-seconds per month; past that the serverless database bills normally.
+   Check `autoPauseDelay` is still 60 — an always-on database burns the grant in
+   about a day.
+2. **Storage grew past the free allowance**, usually because the `raw/`
+   lifecycle rule was removed or the curated container accumulated versions.
+3. **Container Apps exceeded the monthly free grant** (180,000 vCPU-seconds and
+   360,000 GiB-seconds). `minReplicas: 0` on the web app is what keeps this near
+   zero; setting it to 1 is the single change most likely to start a bill.
+
+### Stopping the bleeding without losing the work
+
+```bash
+az containerapp update -g rg-h1b -n h1b-web --min-replicas 0 --max-replicas 0 --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+That takes the dashboard offline and leaves every byte of data in place. It is
+reversible in one command and is almost always the right first move — teardown
+(§9) is not, because rebuilding costs an hour and the data has to be reloaded.
+
+---
+
+## 9. Teardown
+
+One command removes every Azure resource this project created:
+
+```bash
+az group delete -n rg-h1b --yes --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+> **This has never been run.** Everything else in this runbook was observed;
+> this section is the one exception, and pretending otherwise would be the exact
+> failure the rest of the document keeps recording. What follows is an inventory
+> taken from the live subscription, not a claim about what the command did.
+
+### What is in the group, and therefore goes
+
+Read from `az resource list -g rg-h1b`:
+
+```
+Microsoft.App/containerApps           h1b-web
+Microsoft.App/jobs                    h1b-etl
+Microsoft.App/managedEnvironments     h1b-env
+Microsoft.Insights/actiongroups       ag-h1b-budget
+Microsoft.Sql/servers                 sql-h1b-hutymqa65yoty
+Microsoft.Sql/servers/databases       sql-h1b-hutymqa65yoty/master
+Microsoft.Sql/servers/databases       sql-h1b-hutymqa65yoty/sqldb-h1b
+Microsoft.Storage/storageAccounts     sth1bhutymqa65yoty
+```
+
+All 850,321 filings live in `sqldb-h1b`, and the nine Parquet caches live in
+`sth1bhutymqa65yoty`. **There is no backup outside this group.** The source
+`.xlsx` files are on the DOL's website and in `data/raw/` locally; `data/h1b.db`
+is committed to the repository. So the data is reproducible, not backed up —
+the loader is the backup.
+
+### What survives, and it is more than it looks
+
+Verified present outside the resource group:
+
+| survives | where it lives | matters because |
+|---|---|---|
+| App registration `h1b-github-actions` and both federated credentials | Entra ID, not a resource group | CI can still authenticate to a subscription with nothing in it |
+| Budget `h1b-zero-spend` | subscription scope | the guardrail outlives the thing it guards |
+| Both GHCR packages | GitHub | images stay pullable and public |
+| Repository variables `AZURE_CLIENT_ID` / `_TENANT_ID` / `_SUBSCRIPTION_ID` | GitHub | not secrets, and still correct |
+| The Streamlit Cloud dashboard (Phase 1) | Streamlit Cloud | entirely unrelated infrastructure; it reads the committed SQLite file |
+
+**One thing quietly half-breaks.** The budget survives, but its notifications
+name an action group *inside* `rg-h1b`:
+
+```
+contactGroups: /subscriptions/.../resourceGroups/rg-h1b/providers/microsoft.insights/actionGroups/ag-h1b-budget
+contactEmails: justinrheydavid@gmail.com
+```
+
+Delete the group and that `contactGroups` reference dangles. Email alerts
+continue, because `contactEmails` is set directly on the budget — so the
+guardrail degrades rather than disappearing. Redeploying `monitoring.bicep`
+recreates the action group under the same name and restores it.
+
+### If you want everything gone
+
+The resource group is not sufficient. Also remove, in this order:
+
+```bash
+az ad app delete --id 47394bb2-60d0-459c-ba7c-563e015a9fe5
+```
+
+```bash
+az consumption budget delete --budget-name h1b-zero-spend --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
+```
+
+Then delete both packages from GitHub (repo → Packages → package settings →
+Delete package) and the three repository variables. **Delete the budget last**,
+or you spend the window between deletions with no spend guardrail at all.
+
+### Coming back afterwards
+
+Redeploying is §6, with one difference worth expecting: `main.bicep` derives the
+storage and SQL server suffix from the resource group's ID, and a recreated
+group gets a **new** ID. So the names change, the dashboard's FQDN changes, and
+`sql/grant_identities.sql` has to be run again because the database is new and
+so are the managed identities' principal IDs. Nothing in the repository needs
+editing for any of that — which is what §6's last paragraph is about, and what
+`tests/test_infra.py` protects.

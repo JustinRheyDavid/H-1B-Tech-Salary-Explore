@@ -3,7 +3,11 @@
 What US tech jobs actually pay, from 850,321 wage figures employers filed with
 the Department of Labor — searchable by job title, city and year.
 
-### ▶ [Open the live dashboard](https://h-1b-tech-salary-explore-morzlyjgltmfnutdx7pa68.streamlit.app/)
+### ▶ [Open the live dashboard](https://h-1b-tech-salary-explore-morzlyjgltmfnutdx7pa68.streamlit.app/) &nbsp;·&nbsp; [the same app, running on Azure](https://h1b-web.calmwave-8f560d92.canadacentral.azurecontainerapps.io/)
+
+Two deployments of one codebase. The first reads a SQLite file committed to this
+repository; the second reads Azure SQL from a container, and takes a few seconds
+to wake up because it scales to zero when nobody is looking.
 
 ---
 
@@ -21,8 +25,11 @@ and 73% of the rows blank. Cleaning it is most of the work, and the
 
 ## Status
 
-Complete and deployed. Built in ten steps against
-[`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md).
+Complete and deployed twice. **Phase 1** built the application in ten steps
+against [`docs/plans/h1b-salary-explorer.md`](docs/plans/h1b-salary-explorer.md);
+**Phase 2** moved it onto Azure in twelve more, against
+[`docs/plans/azure-migration.md`](docs/plans/azure-migration.md), without the
+application code learning that it had moved.
 
 - [x] 1. Repo skeleton and dependencies
 - [x] 2. Data acquisition
@@ -34,6 +41,17 @@ Complete and deployed. Built in ten steps against
 - [x] 8. Streamlit dashboard
 - [x] 9. Deploy
 - [x] 10. Documentation
+
+Phase 2 — Azure:
+
+- [x] 1–2. Account, spend guardrails
+- [x] 3–5. Storage, Azure SQL, Container Apps
+- [x] 6. Managed identities and grants
+- [x] 7–8. Raw data in Blob, T-SQL schema
+- [x] 9. ETL job — loads 850,321 filings from a container
+- [x] 10. Dashboard reads Azure SQL
+- [x] 11. CI and deployment from GitHub, with no stored secret
+- [x] 12. Runbook, README, teardown
 
 ## Data sources
 
@@ -124,8 +142,88 @@ schema: the planned three-table version measured 148 MB, above GitHub's 100 MB
 file limit. Lookup tables, integer wages and indexes only on the two columns
 queries filter on bring it to 78 MB with all 850,321 filings intact.
 
-230 tests cover the cleaning rules, the loader, the SQL and the dashboard
-itself, which is exercised headlessly through Streamlit's `AppTest`.
+322 tests cover the cleaning rules, the loader, the SQL, the dashboard —
+exercised headlessly through Streamlit's `AppTest` — and the contract between
+the Bicep templates and the code that reads them. 23 of them talk to live Azure
+and are deselected by default.
+
+## Architecture on Azure
+
+The same code, deployed a second way. `DB_BACKEND` picks the backend; nothing
+above `src/db/` knows which one it got.
+
+```
+ GitHub repo
+   │
+   ├── push to main ──▶ GitHub Actions ──┬──▶ build images ──▶ ghcr.io (free, public)
+   │                    (OIDC, no secrets)│
+   │                                      └──▶ az deployment (Bicep) ──▶ Azure
+   │
+   └─────────────────────────────────────────────────────────────────────┐
+                                                                          ▼
+  ┌──────────────────────────── Azure Resource Group: rg-h1b ───────────────────────────────────┐
+  │                                                                                              │
+  │   Blob Storage                 Container Apps Job              Azure SQL Database            │
+  │   ┌──────────────┐   read      ┌──────────────────┐   write    ┌────────────────────┐        │
+  │   │ raw/  *.pq   │ ──────────▶ │     h1b-etl      │ ─────────▶ │     sqldb-h1b      │        │
+  │   │ curated/*.pq │ ◀────────── │ (manual trigger) │            │  serverless, free  │        │
+  │   └──────────────┘   write     └──────────────────┘            │  auto-pause 60 min │        │
+  │                                         │                      └────────────────────┘        │
+  │                                  managed identity                        ▲                   │
+  │                                                                          │ read              │
+  │                                            Container App                 │                   │
+  │                                            ┌──────────────────┐          │                   │
+  │                                            │ h1b-web          │ ─────────┘                   │
+  │                                            │ Streamlit,       │                              │
+  │                                            │ min replicas = 0 │                              │
+  │                                            └──────────────────┘                              │
+  │                                                     │ HTTPS                                  │
+  └─────────────────────────────────────────────────────┼──────────────────────────────────────┘
+                                                        ▼
+                                     https://h1b-web.<region>.azurecontainerapps.io
+```
+
+**There is no password anywhere in this diagram.** The SQL server has
+`azureADOnlyAuthentication` on, so there is no password to steal; the storage
+account has `allowSharedKeyAccess` off, so there is no key. Both containers
+authenticate with managed identities, and GitHub Actions authenticates to Azure
+through OIDC — a token minted per run and trusted because of a federated
+credential naming this repository and this branch. `gh secret list` is empty,
+and that is the point.
+
+### Why these services
+
+Every choice here was made against one constraint: **the whole thing must cost
+$0.00.** It does — the budget reads `0.00 CAD`.
+
+- **Azure SQL Database, serverless free offer** — 100,000 vCore-seconds and
+  32 GB per month. Free depends entirely on `autoPauseDelay: 60`: the database
+  sleeps after an idle hour and stops consuming the grant. The cost is that the
+  first connection after a quiet spell is *refused* while it resumes, which is
+  why both the loader and the dashboard retry rather than treating that as an
+  error.
+- **Container Apps, consumption plan** — 180,000 vCPU-seconds and 360,000
+  GiB-seconds free per month. `minReplicas: 0` is what keeps it there; set it to
+  1 and this becomes the first line item on a bill.
+- **Blob Storage** — the free grant covers the 183 MB of Parquet caches easily,
+  and a lifecycle rule deletes `raw/` after 90 days so it cannot creep.
+- **GitHub Container Registry, not Azure Container Registry** — ACR has no free
+  tier and Basic is about $5/month. This is the single most likely way a project
+  like this starts costing money, and it was decided before any code was
+  written.
+- **No Log Analytics workspace** — billable past 5 GB/month. The trade is real
+  and it bit: when the ETL job failed, the container's log stream had already
+  rotated most of the useful output away, so the diagnosis had to be rebuilt
+  from one surviving line.
+
+The interesting number is the one that is *not* free: a cold start from zero
+replicas measured **32 seconds** from genuine idle, against a 30-second target.
+The deployment reports that figure on every run and does not fail on it — a slow
+dashboard is a working dashboard, and failing the deploy would remove the fast
+fix, which is rolling back.
+
+Standing it up in your own subscription, refreshing the data, and tearing it all
+down are in [`docs/azure-runbook.md`](docs/azure-runbook.md).
 
 ## Running locally
 
