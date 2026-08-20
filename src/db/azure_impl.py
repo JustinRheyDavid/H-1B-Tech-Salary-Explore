@@ -32,10 +32,13 @@ answers, so they surface immediately:
 
 from __future__ import annotations
 
+import ctypes
 import os
+import re
 import struct
 import time
 import warnings
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -199,6 +202,54 @@ def _is_resuming(exc: Exception) -> bool:
     return sqlstate in _RETRYABLE_SQLSTATES or _RESUMING in str(exc)
 
 
+#: SQLSTATE for "the driver manager could not load the driver".
+_DRIVER_NOT_LOADED = "01000"
+
+#: Where the Debian package puts the driver, and where odbcinst.ini points.
+_ODBCINST = Path("/etc/odbcinst.ini")
+
+
+def driver_diagnosis() -> str:
+    """Why the driver would not load, in the loader's own words rather than ODBC's.
+
+    **unixODBC reports every ``dlopen`` failure as "file not found"**, including
+    the case where the file is plainly present and one of its *dependencies* is
+    not. That message cost this project a full diagnosis once: the ETL container
+    reported ``Can't open lib '…/libmsodbcsql-18.6.so.2.1' : file not found``
+    while the web container, whose image layer holding that exact file is
+    byte-identical (same digest, verified against the registry), queried Azure
+    SQL without complaint.
+
+    ``ctypes.CDLL`` calls ``dlopen`` directly, so ``dlerror()`` comes back
+    unedited — and when the real cause is a missing dependency it names the
+    library, which is the one fact the ODBC message removes.
+
+    Returns a printable report and never raises: this runs on a path that is
+    already failing, and a diagnostic that throws is worse than none.
+    """
+    lines = ["ODBC driver diagnosis:"]
+    try:
+        registered = _ODBCINST.read_text() if _ODBCINST.exists() else ""
+        lines.append(f"  {_ODBCINST}: {'present' if registered else 'MISSING'}")
+        paths = re.findall(r"^\s*Driver\s*=\s*(\S+)", registered, re.MULTILINE)
+        if not paths:
+            lines.append("  no Driver= line — the package registered nothing")
+        for path in paths:
+            exists = Path(path).exists()
+            lines.append(f"  {path}: {'exists' if exists else 'DOES NOT EXIST'}")
+            if not exists:
+                continue
+            try:
+                ctypes.CDLL(path)
+                lines.append("    dlopen: succeeded — the driver itself is fine")
+            except OSError as exc:
+                # The message names the missing dependency; ODBC's does not.
+                lines.append(f"    dlopen: {exc}")
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not raise
+        lines.append(f"  diagnosis itself failed: {exc!r}")
+    return "\n".join(lines)
+
+
 def connect_awake(
     server_name: str | None = None,
     database_name: str | None = None,
@@ -224,6 +275,12 @@ def connect_awake(
             return connect(server_name, database_name)
         except pyodbc.Error as exc:
             if not _is_resuming(exc):
+                # Say what "file not found" actually meant, while there is still
+                # a process alive to say it in. The container's log stream is all
+                # there is — the environment has no Log Analytics workspace,
+                # because one is billable — and it dies with the replica.
+                if echo and (exc.args[0] if exc.args else "") == _DRIVER_NOT_LOADED:
+                    echo(driver_diagnosis())
                 raise
             if time.time() >= deadline:
                 sqlstate = exc.args[0] if exc.args else "?"

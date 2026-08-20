@@ -199,6 +199,25 @@ def run(
     totals would look plausible and the joins would be wrong.
     """
     started = time.time()
+
+    # Prove the database is reachable before doing two minutes of work that only
+    # matters if it is.
+    #
+    # This is not tidiness. The third container run downloaded 9 caches, cleaned
+    # 850,321 filings and published the curated parquet — 115 seconds — and then
+    # failed to open the ODBC driver, which is a condition that was already true
+    # when the process started. Everything before the failure was wasted, and
+    # because the container log stream retains almost nothing and dies with the
+    # replica, the useful line had to be recovered from a log that had nearly
+    # rotated it away.
+    #
+    # It also removes a confound. A connection that fails only *after* the tables
+    # are built cannot be told apart from one that fails because they were built;
+    # connecting first and last answers that question with the run itself rather
+    # than with an argument.
+    connect_awake(timeout=RESUME_TIMEOUT, wait=RESUME_WAIT, echo=echo).close()
+    echo("database reachable")
+
     with tempfile.TemporaryDirectory() as scratch:
         directory = Path(cache_dir) if cache_dir else Path(scratch)
         paths = download_caches(directory)
@@ -211,6 +230,13 @@ def run(
             echo(f"published {write_curated(cleaned)}")
 
         tables = load.build_tables(cleaned)
+
+        # `tables` holds everything the load needs from here on, and `cleaned` is
+        # ~0.5 GB that would otherwise stay alive through the whole insert for
+        # the sake of one integer in _verify. Measured: 2.52 GB live at this
+        # point, 2.01 GB after.
+        expected = len(cleaned)
+        del cleaned
 
     connection = connect_awake(timeout=RESUME_TIMEOUT, wait=RESUME_WAIT, echo=echo)
     written: dict[str, int] = {}
@@ -228,7 +254,7 @@ def run(
     finally:
         connection.close()
 
-    _verify(written, len(cleaned))
+    _verify(written, expected)
     echo(f"loaded in {time.time() - started:.0f}s")
     return written
 

@@ -435,3 +435,96 @@ def test_azure_holds_the_full_dataset():
         connection.close()
 
     assert actual == expected
+
+
+# --------------------------------------------------------------------------
+# Order of operations, and the diagnosis when the driver will not load
+# --------------------------------------------------------------------------
+
+
+def test_run_reaches_the_database_before_doing_the_work(monkeypatch):
+    """Connect first, or spend two minutes earning the right to fail.
+
+    The third container run downloaded nine caches, cleaned 850,321 filings and
+    published the curated parquet — 115 seconds — before failing to open the
+    ODBC driver, a condition that was already true when the process started.
+
+    ``run`` had no test at all until this one, which is how a reordering of its
+    whole body could pass a green suite.
+    """
+    calls: list[str] = []
+
+    class _Connection:
+        def close(self):
+            calls.append("close")
+
+        def cursor(self):
+            return object()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+    def _connect(*_args, **_kwargs):
+        calls.append("connect")
+        return _Connection()
+
+    frame = pd.DataFrame({"filing_id": [1]})
+    monkeypatch.setattr(load_azure, "connect_awake", _connect)
+    monkeypatch.setattr(
+        load_azure, "download_caches", lambda _d: calls.append("download") or []
+    )
+    monkeypatch.setattr(load_azure, "read_cleaned", lambda _p: frame)
+    monkeypatch.setattr(load_azure, "clear", lambda _c: calls.append("clear"))
+    monkeypatch.setattr(load_azure, "insert", lambda _c, _t, f: len(f))
+    monkeypatch.setattr(load_azure.load, "build_tables", lambda _c: {"filings": frame})
+
+    load_azure.run(publish_curated=False, echo=lambda *_: None)
+
+    assert calls.index("connect") < calls.index("download"), (
+        f"the database must be reached before the work begins; got {calls}"
+    )
+    assert calls.index("close") < calls.index("download"), (
+        "the probe connection must be closed, not held across the whole load"
+    )
+    assert calls.count("connect") == 2, "probe, then the connection that loads"
+
+
+def test_the_driver_diagnosis_says_which_file_is_missing(tmp_path, monkeypatch):
+    """unixODBC says "file not found" whether or not the file is there.
+
+    That message sent this project looking for a missing driver inside an image
+    that provably contained it — the layer holding it is byte-identical to the
+    web image's, which loads the same driver without complaint. This asserts the
+    diagnosis distinguishes the two cases ODBC conflates.
+    """
+    from src.db import azure_impl
+
+    absent = tmp_path / "odbcinst-absent.ini"
+    absent.write_text("[ODBC Driver 18 for SQL Server]\nDriver = /nope/libmsodbcsql.so\n")
+    monkeypatch.setattr(azure_impl, "_ODBCINST", absent)
+    assert "DOES NOT EXIST" in azure_impl.driver_diagnosis()
+
+    # A file that exists but is not a loadable shared object: dlopen must be the
+    # thing that speaks, because its message is the one that names a dependency.
+    present = tmp_path / "libnotreally.so"
+    present.write_bytes(b"not an ELF object")
+    registered = tmp_path / "odbcinst-present.ini"
+    registered.write_text(f"[ODBC Driver 18 for SQL Server]\nDriver = {present}\n")
+    monkeypatch.setattr(azure_impl, "_ODBCINST", registered)
+    report = azure_impl.driver_diagnosis()
+    assert "exists" in report and "dlopen:" in report
+
+
+def test_the_diagnosis_never_raises(monkeypatch):
+    """It runs on a path that is already failing; throwing there hides the cause."""
+    from src.db import azure_impl
+
+    class _Exploding:
+        def exists(self):
+            raise OSError("filesystem is having a day")
+
+    monkeypatch.setattr(azure_impl, "_ODBCINST", _Exploding())
+    assert "diagnosis itself failed" in azure_impl.driver_diagnosis()

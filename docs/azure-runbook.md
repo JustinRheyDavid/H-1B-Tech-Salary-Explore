@@ -1515,12 +1515,16 @@ image name.
 `h1b-etl-h0urc4s`, started 16:58:01 UTC, `Failed` at 16:59:40. Four things were
 untested before it; it settled three of them.
 
-**Passed, and these were the real unknowns.** The msodbcsql18 install loads under
-`python:3.11-slim` — the Debian 12 / `bookworm` repository path is the one that
-matches; a `bullseye` path installs a driver that will not load. Managed-identity
-blob access works from inside the job: the identity, the role assignment and
-`DefaultAzureCredential`'s chain, none of which resemble the `az login` this
-laptop authenticates with. All 9 caches downloaded in 74 s.
+**Passed.** Managed-identity blob access works from inside the job: the identity,
+the role assignment and `DefaultAzureCredential`'s chain, none of which resemble
+the `az login` this laptop authenticates with. All 9 caches downloaded in 74 s.
+
+> **A claim made here and then withdrawn.** This section first said run 1 proved
+> "the msodbcsql18 install loads under `python:3.11-slim`". It proved nothing of
+> the kind — the run died in `read_cleaned`, which is before `connect_awake`, so
+> the driver was never opened. Run 3 opened it and it failed. Inferring that a
+> component works because the run got past the line *above* it is the same error
+> as reading a green suite that skipped.
 
 **Failed: 850,321 rows do not fit in 2 GiB.** The last line the container logged
 was `downloaded 9 caches`; it died 25 s later, before `cleaned N filings`, which
@@ -1560,6 +1564,71 @@ medium-high — so the console stream is all there is, it retains almost nothing
 and it dies with the replica. `az containerapp job logs show` returned exactly
 one application line. Diagnosis came from the last line logged plus a local
 measurement, which worked here and will not always.
+
+### Runs 2 and 3, 2026-08-20 — the memory fix worked, and uncovered the next wall
+
+**Run 2 (`h1b-etl-om3mknp`) failed identically to run 1.** Started before the
+4 Gi change had been *deployed*: the branch had it, the live job still read
+`cpu: 1.0, memory: 2Gi`. Bicep only takes effect when a deployment applies it,
+and `az containerapp job start` reruns whatever configuration is live. Failed at
+92 s, same place. Worth recording because it is a second, independent
+observation of the OOM — deterministic, and the database survived it too.
+
+**Run 3 (`h1b-etl-dv4jeb3`), on 4 Gi, got past it.** The log:
+
+```
+17:15:38  downloaded 9 caches
+17:15:59  cleaned 850,321 filings          <- the memory wall, cleared
+17:16:01  published filings_clean.parquet  <- blob WRITE works too, not just read
+17:16:07  load failed: ('01000', "[unixODBC][Driver Manager]Can't open lib
+          '/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.6.so.2.1'
+          : file not found (0) (SQLDriverConnect)")
+```
+
+So the memory diagnosis was right and the fix holds. Three of the four unknowns
+in this section are now settled by observation rather than by inference.
+
+### The driver that will not load — UNRESOLVED
+
+**"file not found" is not true, and unixODBC does not mean it literally.** What
+is established:
+
+- The file *is* in the image. Pulled the ETL image's manifest from GHCR and
+  listed layer 4: `opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.6.so.2.1`,
+  present, along with `etc/odbcinst.ini`.
+- **Layers 0–7 of the two images are byte-identical** — same digests, verified
+  against the registry. The driver install is literally the same filesystem in
+  both. Only the `COPY` and `useradd` layers differ, and both run as uid 10001.
+- **The web container loads that same driver and queries Azure SQL.** The live
+  dashboard renders "850,321 tech filings", a number that cannot come from
+  anywhere else.
+
+So one container opens the driver and the other cannot, from an identical
+filesystem. unixODBC reports *every* `dlopen` failure as "file not found",
+including a missing **dependency** of the library — which is the message that
+would actually name the problem, and the one it discards.
+
+**The memory theory, raised and then undercut.** The failure lands right after
+all six tables are built, so a `dlopen` failing under cgroup pressure looked
+likely. Measured on this laptop at that exact point: **2.52 GB live of 4.29 GB
+available** — 59%, not a ceiling. Recorded as considered and not supported,
+rather than quietly dropped.
+
+**What the next run will settle, by construction.** `run` now connects *before*
+it downloads anything, and `connect_awake` prints `driver_diagnosis()` on
+SQLSTATE 01000 — which reads `odbcinst.ini`, checks whether each registered path
+exists, and calls `ctypes.CDLL` so `dlerror()` comes back unedited. Then:
+
+| next run says | conclusion |
+|---|---|
+| probe fails, diagnosis names a missing `lib*.so` | a dependency is absent from the image; fix the Dockerfile |
+| probe fails, diagnosis says the driver path does not exist | the registration and the package disagree |
+| probe **succeeds**, later connect fails | genuinely state-dependent, and memory is back on the table |
+| both succeed | the load completes and the question was transient |
+
+Connecting first is worth having regardless: run 3 spent 115 seconds
+downloading, cleaning and publishing to earn the right to fail on a condition
+that was already true when the process started.
 
 ### Running it
 
