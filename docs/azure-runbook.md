@@ -1299,11 +1299,10 @@ Two divergences are asserted as acceptable rather than fixed:
 
 ## 4b. Step 9 — load Azure SQL from Blob
 
-**Status: loaded 2026-08-18 from this laptop.** The row counts below were read
-from the database, not transcribed from the plan. The image is built and pushed
-by CI as of 2026-08-19; **the job has still never been executed** — see
-"Running it in its container" below, which is the last unexercised component in
-the system.
+**Status: DONE.** Loaded from this laptop 2026-08-18, then loaded again
+2026-08-20 by the job running in its own container on Azure — see "The ETL job
+runs in its container" below. The row counts were read from the database both
+times, not transcribed from the plan.
 
 ```
 LOADER  = src/etl/load_azure.py    download -> clean -> curated -> bulk insert
@@ -1501,7 +1500,41 @@ server that it now raises in 1.5 s, and that a healthy connect is unaffected.
 `AZURE_SQL_SERVER` is waited on too. That is the accepted half of the trade —
 it ends in an error naming the SQLSTATE rather than in silence.
 
-### Building the image — DONE 2026-08-19. Running it — one failed attempt so far.
+### The ETL job runs in its container — DONE 2026-08-20, on the fourth attempt
+
+`h1b-etl-nzdwt4b`, `Succeeded`, 172 seconds end to end:
+
+```
+17:52:52  database reachable              <- the probe, before any work is done
+17:52:54  downloaded 9 caches
+17:53:15  cleaned 850,321 filings
+17:53:17  published filings_clean.parquet
+17:53:39  employers        43,573 rows    3.8s
+17:53:39  occupations          63 rows    0.0s
+17:53:55  titles          123,990 rows   15.7s
+17:53:55  locations         8,570 rows    0.4s
+17:53:55  visa_classes          4 rows    0.0s
+17:55:42  filings         850,321 rows  107.0s
+17:55:42  loaded in 172s
+```
+
+**Counted again from outside the container**, by `pyodbc` from this laptop after
+it finished: 850,321 / 43,573 / 123,990 / 8,570 / 63 / 4 — all six match. The
+job's own `_verify` compares what the cursor reported against what was cleaned;
+this compares what the *database holds* against what the plan named, which is a
+different question and the one Step 9's acceptance criterion actually asks.
+
+`filings` is 107 s of the 172 — `fast_executemany` at roughly 7,900 rows/second.
+`titles` costs 15.7 s for 123,990 rows because of the `key_exact` unique index.
+Comfortably inside `replicaTimeout: 3600`.
+
+Four attempts, and each failure was a different real defect: 2 GiB was too small
+(twice, the second because the fix was committed but not deployed), then the ODBC
+driver's `libgssapi_krb5.so.2` had been removed by `autoremove`. None of them
+damaged the data, because `run` does every expensive step before it opens a
+connection, so `clear` stays unreachable until the work has already succeeded.
+
+### How it is built
 
 This machine has no container runtime — no Docker, no podman, no colima — so the
 image was never built here. Step 11's `deploy.yml` builds and pushes it on every
@@ -1526,7 +1559,7 @@ the `az login` this laptop authenticates with. All 9 caches downloaded in 74 s.
 > component works because the run got past the line *above* it is the same error
 > as reading a green suite that skipped.
 
-**Failed: 850,321 rows do not fit in 2 GiB.** The last line the container logged
+**Failed at the time: 850,321 rows do not fit in 2 GiB.** The last line the container logged
 was `downloaded 9 caches`; it died 25 s later, before `cleaned N filings`, which
 places it inside `read_cleaned`. Measured on this laptop over the same nine
 caches:
@@ -1644,6 +1677,25 @@ Two things close it:
   destructive load, which is far too expensive to use as a smoke test; that is
   precisely why two broken images shipped unnoticed. Tested to be incapable of
   reading, clearing or writing.
+
+  **Running it as a job execution is more awkward than it looks.**
+  `az containerapp job start --args "--check"` fails: az reads a value beginning
+  with `--` as a flag of its own, so it must be `--args="--check"`. Do that and
+  the next error is `ContainerAppImageRequired` — the container-override
+  arguments do not *merge* with the job's template, they replace it, so
+  `--container-name`, `--args` and `--image` have to be given together:
+
+  ```bash
+  az containerapp job start -g rg-h1b -n h1b-etl --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3     --container-name etl --image ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest --args="--check"
+  ```
+
+  That replacement is also why an override execution is a weaker test than it
+  appears: it does not carry the template's environment variables, so the code
+  falls back to the defaults in `blob.py` and `azure_impl.py`. Those are correct
+  for *this* deployment and wrong for anyone else's, which is the exact failure
+  `tests/test_infra.py` exists to prevent. Use `--check` locally and in the
+  image's own build; do not treat an override execution as proof the deployed
+  configuration is right.
 
 > **A claim withdrawn.** This runbook and two reports said the dashboard proved
 > the driver worked, because the page rendered "850,321 tech filings". That
