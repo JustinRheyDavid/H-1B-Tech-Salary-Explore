@@ -287,7 +287,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip publishing the cleaned frame to the curated container",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="connect, report, and exit without touching the data",
+    )
     args = parser.parse_args(argv)
+
+    # A way to ask "can this container reach the database" that does not erase
+    # it first.
+    #
+    # Both images once shipped and deployed with an ODBC driver that could not
+    # load, and nothing caught it: the job failed after two minutes of work, and
+    # the dashboard served HTTP 200 with the error inside the page, where the
+    # deployment's own health check cannot see it. The only way to exercise the
+    # driver was a full destructive load, which is far too expensive to use as a
+    # smoke test. This is that test, and it is the same code path the load uses.
+    if args.check:
+        try:
+            connect_awake(timeout=RESUME_TIMEOUT, wait=RESUME_WAIT, echo=print).close()
+        except Exception as exc:  # noqa: BLE001 - the exit code is the signal
+            print(f"check failed: {exc}", file=sys.stderr)
+            return 1
+        print("database reachable")
+        return 0
 
     try:
         run(cache_dir=args.cache_dir, publish_curated=not args.no_curated)
