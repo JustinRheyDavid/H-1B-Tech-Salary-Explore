@@ -142,7 +142,7 @@ schema: the planned three-table version measured 148 MB, above GitHub's 100 MB
 file limit. Lookup tables, integer wages and indexes only on the two columns
 queries filter on bring it to 78 MB with all 850,321 filings intact.
 
-322 tests cover the cleaning rules, the loader, the SQL, the dashboard —
+327 tests cover the cleaning rules, the loader, the SQL, the dashboard —
 exercised headlessly through Streamlit's `AppTest` — and the contract between
 the Bicep templates and the code that reads them. 23 of them talk to live Azure
 and are deselected by default.
@@ -221,6 +221,12 @@ replicas measured **32 seconds** from genuine idle, against a 30-second target.
 The deployment reports that figure on every run and does not fail on it — a slow
 dashboard is a working dashboard, and failing the deploy would remove the fast
 fix, which is rolling back.
+
+Checking that all of it is actually working is one command:
+
+```bash
+./scripts/health-check.sh          # add --full for the 23 live Azure tests
+```
 
 Standing it up in your own subscription, refreshing the data, and tearing it all
 down are in [`docs/azure-runbook.md`](docs/azure-runbook.md).

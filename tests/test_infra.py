@@ -17,7 +17,11 @@ worth asserting is that the literal strings agree.
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -136,6 +140,70 @@ def test_the_runbook_only_tells_a_stranger_to_run_files_that_exist():
         assert (root / path).exists(), (
             f"the runbook tells you to run {path}, which does not exist"
         )
+
+
+#: Parameters in `main.parameters.json` that are personal identity, not config.
+#: Deploying with these unchanged points somebody else's infrastructure at this
+#: tenant and this inbox.
+IDENTITY_PARAMETERS = ("entraAdminObjectId", "entraAdminLogin", "alertEmailAddress")
+
+
+def test_the_walkthrough_names_every_parameter_a_stranger_must_change():
+    """§6's whole purpose is somebody else deploying this successfully.
+
+    `infra/main.parameters.json` is committed with *this* deployment's values,
+    and three of them identify a person rather than configure a system. ARM
+    deploys the file exactly as written, so nothing catches it: the deployment
+    succeeds, a principal from a foreign tenant is named SQL admin, and the
+    budget alerts go to the wrong inbox.
+
+    The first version of §6 passed that file verbatim and said "nothing should
+    need editing" a few lines later. This asserts the section names all three.
+    """
+    walkthrough = RUNBOOK.read_text().split("## 6. Deploying")[1].split("\n## 7.")[0]
+    parameters = json.loads(
+        (RUNBOOK.parent.parent / "infra" / "main.parameters.json").read_text()
+    )["parameters"]
+    for name in IDENTITY_PARAMETERS:
+        assert name in parameters, f"{name} is no longer a parameter; update this test"
+        assert name in walkthrough, (
+            f"§6 does not tell a stranger to change {name!r}, which is committed "
+            f"with this deployment's own value"
+        )
+
+
+def test_the_readme_test_count_is_the_real_one():
+    """The README states a test count, and it has been wrong twice in two commits.
+
+    Both times the same way: count, then add tests in the same change, then
+    commit the stale number. It is a small lie in the most-read file in the
+    repository, sitting a few lines from a claim about rigour — and §7 already
+    lists it as a number that drifts. Counting it here is cheaper than
+    remembering to.
+
+    ``--collect-only`` does not execute anything, so this cannot recurse.
+    """
+    claimed = re.search(r"(\d+) tests cover", README.read_text())
+    assert claimed, "the README no longer states a test count; drop this test too"
+
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--collect-only",
+         "-p", "no:cacheprovider", str(README.parent)],
+        capture_output=True, text=True, cwd=README.parent,
+    ).stdout
+    actual = re.search(r"(\d+) tests collected", collected)
+    assert actual, f"could not read a count from pytest:\n{collected[-500:]}"
+    assert claimed.group(1) == actual.group(1), (
+        f"README says {claimed.group(1)} tests; pytest collects {actual.group(1)}"
+    )
+
+
+def test_the_health_check_is_runnable_and_documented():
+    """A check nobody can find is a check nobody runs."""
+    script = RUNBOOK.parent.parent / "scripts" / "health-check.sh"
+    assert script.exists(), "scripts/health-check.sh is gone"
+    assert os.access(script, os.X_OK), "health-check.sh is not executable"
+    assert "health-check.sh" in RUNBOOK.read_text(), "the runbook never mentions it"
 
 
 def test_the_readme_does_not_leak_the_home_ip():
