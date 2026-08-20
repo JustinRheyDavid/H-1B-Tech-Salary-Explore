@@ -2128,6 +2128,37 @@ drop it and every push to `main` goes red. Verified both bite by flipping each.
 <!-- Filled in as they are actually hit. Seeded from plan §8 with the two that
      are predicted to bite hardest; do not add speculative entries. -->
 
+### Before diagnosing anything, run the health check
+
+```bash
+./scripts/health-check.sh
+```
+
+About twenty seconds, and it exits non-zero if anything failed, so it works in
+CI as well as by hand. `--full` adds the 23 live Azure tests, which take another
+minute and are the strongest single check here.
+
+It reports rather than stopping at the first failure — when something is wrong
+you want the whole picture, not the earliest symptom. It covers the offline
+tests, ruff, the last deploy, spend, the web revision, the last ETL execution,
+the site, and the six row counts read from a real query.
+
+**One line in its output is worded carefully and should stay that way:**
+
+```
+OK    serving its document (HTTP 200) — does NOT prove the database answered
+```
+
+The dashboard returns 200 even when it cannot reach the database: Streamlit
+serves its shell and then streams the error banner over a websocket, where no
+`curl` can see it. Both images once ran for hours in exactly that state,
+reporting 200 the whole time, and the deployment's own check could not tell. The
+row-count check below it is what answers that question.
+
+**A slow first connection is not a failure.** The serverless database pauses
+after an idle hour, so the SQL check can take about a minute while it resumes.
+That is the mechanism keeping the cost at zero.
+
 ### `Login failed for user '<token-identified principal>'`
 
 The managed identity has not been granted access to Azure SQL. The Step 6 grants
@@ -2193,18 +2224,41 @@ Three things need a human, and they are the three most likely to be skipped:
 
 ### The sequence
 
+**Step 0, and it is not optional: edit `infra/main.parameters.json`.** That file
+is committed with *this* deployment's values, and three of them are personal
+identity rather than configuration:
+
+| parameter | committed value | what happens if you leave it |
+|---|---|---|
+| `entraAdminObjectId` | an object ID in **this** tenant | the deployment names a principal your tenant has never heard of as the admin of your SQL server |
+| `entraAdminLogin` | the same person's login | same, and the two must agree with each other |
+| `alertEmailAddress` | this project's owner | **your** budget alerts are emailed to a stranger |
+
+Replace all three with your own before the first deployment. Your object ID and
+login:
+
+```bash
+az ad signed-in-user show --query "{objectId:id, login:userPrincipalName}" -o json
+```
+
+Nothing enforces this — ARM will happily deploy the file as committed — so it is
+first in the sequence rather than a footnote. `tests/test_infra.py` asserts this
+section keeps naming all three, because the failure is silent in both
+directions: the deployment succeeds, and the wrong person gets the alerts.
+
 ```bash
 az group create -n rg-h1b -l canadacentral --subscription <YOUR-SUBSCRIPTION-ID>
 ```
 
 ```bash
-az deployment group create -g rg-h1b --subscription <YOUR-SUBSCRIPTION-ID>   --template-file infra/main.bicep --parameters infra/main.parameters.json   --parameters webImage=mcr.microsoft.com/azuredocs/containerapps-helloworld:latest webTargetPort=80 etlImage=mcr.microsoft.com/azuredocs/containerapps-helloworld:latest
+az deployment group create -g rg-h1b --subscription <YOUR-SUBSCRIPTION-ID>   --template-file infra/main.bicep --parameters infra/main.parameters.json
 ```
 
-The placeholder images come first because `webImage` has no default and your own
-images do not exist yet. **`webTargetPort` moves with `webImage`, always** — 80
-for the placeholder, 8501 for the real Streamlit image. A mismatch does not fail
-the deployment; it succeeds and serves nothing.
+`main.parameters.json` already supplies a placeholder for `webImage`,
+`webTargetPort` and `etlImage`, so the first deployment needs nothing extra —
+your own images do not exist yet. When you replace them, **`webTargetPort` moves
+with `webImage`, always** — 80 for the placeholder, 8501 for the real Streamlit
+image. A mismatch does not fail the deployment; it succeeds and serves nothing.
 
 Note there is **no `assignRoles` here**. It defaults to `true`, which is the
 whole point of the default: you are deploying as your own owner-level account,
@@ -2309,7 +2363,7 @@ Adding a quarter changes the row counts, so these need updating together:
 
 | where | what |
 |---|---|
-| `README.md` | "850,321 wage figures" in the opening line |
+| `README.md` | "850,321 wage figures" in the opening line, and the test count in *Architecture* — both have been wrong before |
 | `app.py:356` | the caption under the title — **hardcoded, not queried** |
 | `docs/azure-runbook.md` §4b | the six row counts |
 | `tests/test_load_azure.py` | the live count assertions |
@@ -2342,15 +2396,23 @@ nothing here and should not be trusted.
 
 §3 covers these in detail. In descending order of likelihood:
 
-1. **The Azure SQL free offer ran out or was never applied.** It grants 100,000
-   vCore-seconds per month; past that the serverless database bills normally.
-   Check `autoPauseDelay` is still 60 — an always-on database burns the grant in
-   about a day.
+1. **Container Apps exceeded the monthly free grant** (180,000 vCPU-seconds and
+   360,000 GiB-seconds, per plan §7). `minReplicas: 0` on the web app is what
+   keeps this near zero; setting it to 1 is the single change most likely to
+   start a bill. The ETL job at 2 vCPU / 4 GiB is the other consumer, and each
+   run costs roughly 600 and 1,200 of those.
 2. **Storage grew past the free allowance**, usually because the `raw/`
    lifecycle rule was removed or the curated container accumulated versions.
-3. **Container Apps exceeded the monthly free grant** (180,000 vCPU-seconds and
-   360,000 GiB-seconds). `minReplicas: 0` on the web app is what keeps this near
-   zero; setting it to 1 is the single change most likely to start a bill.
+3. **Azure SQL — the least likely, and worth saying why.** The free offer grants
+   100,000 vCore-seconds per month, and this database is deployed with
+   `freeLimitExhaustionBehavior: AutoPause` (verified live, and documented in §4
+   and `infra/sql.bicep`). **Exhausting the grant pauses the database rather than
+   billing for it.** For Azure SQL to cost anything here, someone would have to
+   have changed that to `BillOverUsage`, or turned `useFreeLimit` off:
+
+   ```bash
+   az sql db show -g rg-h1b -s <your-server> -n sqldb-h1b --query "{free:useFreeLimit,onExhaust:freeLimitExhaustionBehavior,autoPause:autoPauseDelay}" -o json
+   ```
 
 ### Stopping the bleeding without losing the work
 
