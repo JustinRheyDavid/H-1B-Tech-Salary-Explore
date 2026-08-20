@@ -1588,7 +1588,70 @@ observation of the OOM — deterministic, and the database survived it too.
 So the memory diagnosis was right and the fix holds. Three of the four unknowns
 in this section are now settled by observation rather than by inference.
 
-### The driver that will not load — UNRESOLVED
+### The driver that will not load — RESOLVED 2026-08-20
+
+The diagnostic answered it in **20 seconds**, on the next run:
+
+```
+load failed: ('01000', "Can't open lib '…/libmsodbcsql-18.6.so.2.1' : file not found")
+ODBC driver diagnosis:
+  /etc/odbcinst.ini: present
+  /opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.6.so.2.1: exists
+    dlopen: libgssapi_krb5.so.2: cannot open shared object file: No such file or directory
+```
+
+**The missing file was never the driver. It was `libgssapi_krb5.so.2`,** one of
+the driver's own dependencies — the fact unixODBC discards when it rewrites
+every `dlopen` failure as "file not found".
+
+Two causes, and both had to be fixed:
+
+**1. The base image moved out from under the comment.** `Dockerfile` said
+"Debian 12 (bookworm) is what `python:3.11-slim` is built on". It no longer is —
+the apt lists recovered from the shipped image name **trixie** (Debian 13), while
+`mssql.list` still added the Debian 12 Microsoft repository. That is the same
+mismatch the comment warned about for bullseye, arrived at from the other
+direction, by an unpinned tag drifting. Both images now pin
+`python:3.11-slim-bookworm`.
+
+**2. `autoremove` took a library nothing declared.** Layer 4 of the shipped
+image contains `libkrb5.so.3`, `libk5crypto.so.3` and `libkrb5support.so.0` —
+but not `libgssapi_krb5.so.2`, whose dpkg `.list` and `.postrm` are still there,
+the signature of a package removed rather than never installed. It arrives as an
+auto-installed dependency of `curl`; `msodbcsql18` links against it at runtime
+without declaring it; so `apt-get purge curl gnupg && apt-get autoremove -y`
+removes it and nothing objects. Its three siblings survived because the driver
+*does* declare those. That asymmetry is why this was invisible. It is now named
+explicitly in the install list, which marks it manual and puts it beyond
+`autoremove`'s reach.
+
+**And the dashboard was broken the whole time.** The web image carries the same
+driver layer — byte-identical digest — so it failed identically. The live page
+served HTTP 200 with `The database cannot be read. ('01000', …)` rendered inside
+it. Nothing caught this: `deploy.yml` asserts the Streamlit document is served,
+which was true, and Streamlit streams the error over a websocket where no `curl`
+can see it. The gap was documented in that step's own comment and it still cost
+a wrong "the dashboard is fine" twice.
+
+Two things close it:
+
+- **A build-time `ldd` gate** in both Dockerfiles. It reads the same `NEEDED`
+  entries the dynamic loader will, so an unmet dependency fails the build rather
+  than shipping. Verified the grep logic fails on a "not found" line and passes
+  on a clean one.
+- **`python -m src.etl.load_azure --check`** — connect, report, exit, touching
+  nothing. The only way to exercise the container's driver used to be a full
+  destructive load, which is far too expensive to use as a smoke test; that is
+  precisely why two broken images shipped unnoticed. Tested to be incapable of
+  reading, clearing or writing.
+
+> **A claim withdrawn.** This runbook and two reports said the dashboard proved
+> the driver worked, because the page rendered "850,321 tech filings". That
+> string is a **hardcoded caption** at `app.py:356`, not a query result. The
+> conclusion was drawn from a literal — the same mistake as trusting a green
+> suite that skipped, made while writing about that mistake.
+
+### The investigation, for the record — was UNRESOLVED
 
 **"file not found" is not true, and unixODBC does not mean it literally.** What
 is established:
@@ -1614,16 +1677,17 @@ likely. Measured on this laptop at that exact point: **2.52 GB live of 4.29 GB
 available** — 59%, not a ceiling. Recorded as considered and not supported,
 rather than quietly dropped.
 
-**What the next run will settle, by construction.** `run` now connects *before*
-it downloads anything, and `connect_awake` prints `driver_diagnosis()` on
-SQLSTATE 01000 — which reads `odbcinst.ini`, checks whether each registered path
-exists, and calls `ctypes.CDLL` so `dlerror()` comes back unedited. Then:
+**What settled it.** `run` connects *before* it downloads anything, and
+`connect_awake` prints `driver_diagnosis()` on SQLSTATE 01000 — reading
+`odbcinst.ini`, checking whether each registered path exists, and calling
+`ctypes.CDLL` so `dlerror()` comes back unedited. The first row below is what
+happened; the others are what the other answers would have meant.
 
-| next run says | conclusion |
+| the run says | conclusion |
 |---|---|
-| probe fails, diagnosis names a missing `lib*.so` | a dependency is absent from the image; fix the Dockerfile |
+| **probe fails, diagnosis names a missing `lib*.so`** | **a dependency is absent from the image — this is what happened** |
 | probe fails, diagnosis says the driver path does not exist | the registration and the package disagree |
-| probe **succeeds**, later connect fails | genuinely state-dependent, and memory is back on the table |
+| probe succeeds, later connect fails | genuinely state-dependent, and memory back on the table |
 | both succeed | the load completes and the question was transient |
 
 Connecting first is worth having regardless: run 3 spent 115 seconds

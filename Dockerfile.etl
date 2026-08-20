@@ -10,14 +10,36 @@
 # GHCR paths must be lowercase, so the repository's own capitalization does not
 # survive into the image name.
 
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # The Microsoft ODBC driver. pyodbc is a binding, not a driver: pip installs it
 # happily and then every connection fails with "Can't open lib 'ODBC Driver 18
 # for SQL Server'", which reads like a missing Python package and is not one.
 #
-# Debian 12 (bookworm) is what python:3.11-slim is built on, and the repository
-# path has to match — the bullseye list installs a driver that will not load.
+# **The base tag is pinned to bookworm, and that is the whole point.** This
+# comment used to say "Debian 12 (bookworm) is what python:3.11-slim is built
+# on". That stopped being true: the tag moved to Debian 13 (trixie), and the
+# image kept adding the Debian 12 Microsoft repository to it. The apt lists
+# recovered from the shipped image name trixie; `mssql.list` named bookworm.
+# Pinning the tag makes the sentence above true again and stops it drifting a
+# second time, which an unpinned `python:3.11-slim` guarantees it eventually
+# will.
+#
+# `libgssapi-krb5-2` is named explicitly even though it is a dependency of the
+# driver, because it is the one apt does not protect. It arrives as an
+# auto-installed dependency of curl; msodbcsql18 links against
+# `libgssapi_krb5.so.2` at runtime without declaring it; so `purge curl` +
+# `autoremove` takes it away and nothing objects. Naming it here marks it
+# manually installed, which autoremove will not touch. Its three siblings
+# (libkrb5-3, libk5crypto3, libkrb5support0) survived on their own — that
+# asymmetry is exactly why this was invisible.
+#
+# **Then check, rather than trust.** Both images shipped and deployed with a
+# driver that could not load, and nothing noticed: the ETL job failed after two
+# minutes of work and the dashboard served a 200 with an error banner inside it,
+# which the deployment's own health check cannot see. `ldd` reads the same
+# NEEDED entries the dynamic loader will, so a missing library fails the build
+# here instead of the deployment there.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl gnupg unixodbc \
  && curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
@@ -25,9 +47,15 @@ RUN apt-get update \
  && echo "deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
       > /etc/apt/sources.list.d/mssql.list \
  && apt-get update \
- && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+ && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 libgssapi-krb5-2 \
  && apt-get purge -y curl gnupg \
  && apt-get autoremove -y \
+ && ldd /opt/microsoft/msodbcsql18/lib64/libmsodbcsql-*.so.* > /tmp/driver-ldd.txt \
+ && if grep -q 'not found' /tmp/driver-ldd.txt; then \
+      echo 'the ODBC driver has unmet shared-library dependencies:'; \
+      grep 'not found' /tmp/driver-ldd.txt; exit 1; \
+    fi \
+ && rm -f /tmp/driver-ldd.txt \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

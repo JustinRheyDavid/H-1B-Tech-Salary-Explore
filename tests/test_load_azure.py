@@ -528,3 +528,42 @@ def test_the_diagnosis_never_raises(monkeypatch):
 
     monkeypatch.setattr(azure_impl, "_ODBCINST", _Exploding())
     assert "diagnosis itself failed" in azure_impl.driver_diagnosis()
+
+
+def test_check_connects_and_touches_nothing(monkeypatch, capsys):
+    """``--check`` must be safe to run against the live database, always.
+
+    It exists because the only way to exercise the container's ODBC driver used
+    to be a full load, which TRUNCATEs before it inserts — far too expensive to
+    use as a smoke test, which is why two broken images shipped unnoticed.
+    A check that could erase anything would not get run either.
+    """
+    closed = {"n": 0}
+
+    class _Connection:
+        def close(self):
+            closed["n"] += 1
+
+    def _forbidden(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("--check must not read, clear or write")
+
+    monkeypatch.setattr(load_azure, "connect_awake", lambda *a, **k: _Connection())
+    monkeypatch.setattr(load_azure, "run", _forbidden)
+    monkeypatch.setattr(load_azure, "download_caches", _forbidden)
+    monkeypatch.setattr(load_azure, "clear", _forbidden)
+    monkeypatch.setattr(load_azure, "insert", _forbidden)
+
+    assert load_azure.main(["--check"]) == 0
+    assert closed["n"] == 1, "the check must not leave a connection open"
+    assert "database reachable" in capsys.readouterr().out
+
+
+def test_check_reports_a_failure_in_its_exit_code(monkeypatch, capsys):
+    """The exit code is the whole signal in a container; a message is not enough."""
+
+    def _broken(*_args, **_kwargs):
+        raise RuntimeError("Can't open lib ... file not found")
+
+    monkeypatch.setattr(load_azure, "connect_awake", _broken)
+    assert load_azure.main(["--check"]) == 1
+    assert "check failed" in capsys.readouterr().err
