@@ -124,13 +124,32 @@ module containerapps 'containerapps.bicep' = {
   }
 }
 
+@description('Whether to create the ETL job\'s blob role assignment. True for a deployment run by an owner; false from CI, whose principal is Contributor and cannot write role assignments. See the note below before changing.')
+param assignRoles bool = true
+
 // Depends on both modules above: the storage account to scope the assignment to,
 // and the ETL job's identity to assign it to. Bicep infers the ordering from the
 // output references, so no explicit dependsOn is needed.
 //
 // Covers only the storage half of Step 6. The Azure SQL grants cannot be
 // expressed in ARM — see roles.bicep and sql/grant_identities.sql.
-module roles 'roles.bicep' = {
+//
+// **Why this one module is optional and nothing else is.** Writing a role
+// assignment needs `Microsoft.Authorization/roleAssignments/write`, which
+// Contributor does not have. The deploy workflow's principal is Contributor on
+// this resource group and deliberately no more: the alternative is Role Based
+// Access Control Administrator, which would let anyone who can push to `main`
+// grant themselves roles here. That is a worse thing to own than a skipped
+// resource.
+//
+// The default is `true`, so the path this protects — a stranger deploying into
+// their own subscription, as their own owner-level account — still creates the
+// assignment on the first `az deployment group create`. Only `deploy.yml` passes
+// `false`, and only because the assignment it would write already exists and is
+// already correct. If the ETL job is ever deleted and recreated its principal ID
+// changes, and CI will NOT create the new assignment — run one deployment by
+// hand, or `az role assignment create`, and see runbook §4d.
+module roles 'roles.bicep' = if (assignRoles) {
   name: 'roles'
   params: {
     storageAccountName: storage.outputs.storageAccountName

@@ -1299,9 +1299,11 @@ Two divergences are asserted as acceptable rather than fixed:
 
 ## 4b. Step 9 — load Azure SQL from Blob
 
-**Status: loaded 2026-08-18.** The row counts below were read from the database,
-not transcribed from the plan. The container image is the one part still
-PENDING.
+**Status: loaded 2026-08-18 from this laptop.** The row counts below were read
+from the database, not transcribed from the plan. The image is built and pushed
+by CI as of 2026-08-19; **the job has still never been executed** — see
+"Running it in its container" below, which is the last unexercised component in
+the system.
 
 ```
 LOADER  = src/etl/load_azure.py    download -> clean -> curated -> bulk insert
@@ -1499,29 +1501,91 @@ server that it now raises in 1.5 s, and that a healthy connect is unaffected.
 `AZURE_SQL_SERVER` is waited on too. That is the accepted half of the trade —
 it ends in an error naming the SQLSTATE rather than in silence.
 
-### Building and pushing the image — PENDING
+### Building the image — DONE 2026-08-19. Running it — one failed attempt so far.
+
+This machine has no container runtime — no Docker, no podman, no colima — so the
+image was never built here. Step 11's `deploy.yml` builds and pushes it on every
+push to `main`, and `h1b-etl` is configured with
+`ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:85851c5…`. GHCR paths must
+be lowercase; the repository's own capitalization does not survive into the
+image name.
+
+### Run 1, 2026-08-20 — OOM-killed, and what it proved on the way
+
+`h1b-etl-h0urc4s`, started 16:58:01 UTC, `Failed` at 16:59:40. Four things were
+untested before it; it settled three of them.
+
+**Passed, and these were the real unknowns.** The msodbcsql18 install loads under
+`python:3.11-slim` — the Debian 12 / `bookworm` repository path is the one that
+matches; a `bullseye` path installs a driver that will not load. Managed-identity
+blob access works from inside the job: the identity, the role assignment and
+`DefaultAzureCredential`'s chain, none of which resemble the `az login` this
+laptop authenticates with. All 9 caches downloaded in 74 s.
+
+**Failed: 850,321 rows do not fit in 2 GiB.** The last line the container logged
+was `downloaded 9 caches`; it died 25 s later, before `cleaned N filings`, which
+places it inside `read_cleaned`. Measured on this laptop over the same nine
+caches:
+
+| stage | RSS |
+|---|---|
+| 9 parquet frames in a list | 1.60 GB |
+| after `ingest.combine` — 1,347,103 rows | **2.33 GB** — past the 2.15 GB limit already |
+| after `clean.clean` — 850,321 rows | **3.09 GB** |
+
+The concat is the cliff: the frames list is still alive while pandas builds the
+combined copy, so the peak is roughly double what either holds alone.
+
+The job now asks for **2.0 CPU / 4 Gi** (Container Apps constrains the ratio to
+2 Gi per CPU, so the CPU moves whether the work needs it or not). Still $0 —
+consumption jobs bill against a monthly per-subscription free grant of 180,000
+vCPU-seconds and 360,000 GiB-seconds, and a five-minute run costs roughly 600
+and 1,200 of them.
+
+**The better fix, deliberately not taken yet:** cut the peak rather than raise
+the ceiling. Category dtypes for the 43,573 employers and 123,990 titles
+repeated across 850k rows would take a large bite out of 3.09 GB. Raising the
+limit is the one-line change that gets an end-to-end load proven before Step 12;
+the reduction belongs with the `salary_by_city` rewrite in a focused pass.
+
+**The database was never touched, and that is structural rather than lucky.**
+`run()` does all the reading, cleaning and table-building *before* it opens a
+connection, so `clear()` is unreachable until the expensive work has already
+succeeded. All six counts were unchanged after the failure: 850,321 / 43,573 /
+123,990 / 8,570 / 63 / 4.
+
+**No traceback survived.** The environment has no `appLogsConfiguration` — a Log
+Analytics workspace is billable past 5 GB/month and §8 rates that risk
+medium-high — so the console stream is all there is, it retains almost nothing,
+and it dies with the replica. `az containerapp job logs show` returned exactly
+one application line. Diagnosis came from the last line logged plus a local
+measurement, which worked here and will not always.
+
+### Running it
+
+Run it, and watch it rather than assuming:
 
 ```bash
-docker build -f Dockerfile.etl -t ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest .
-docker push ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest
-az containerapp job update -g rg-h1b -n <job> --image ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest
-az containerapp job start -g rg-h1b -n <job>
+az containerapp job start -g rg-h1b -n h1b-etl --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3
 ```
 
-GHCR paths must be lowercase; the repository's own capitalization does not
-survive into the image name.
+```bash
+az containerapp job execution list -g rg-h1b -n h1b-etl --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3 -o table
+```
 
-**This machine has no container runtime** — no Docker, no podman, no colima —
-so the image has never been built, and nothing in `Dockerfile.etl` beyond its
-syntax has been exercised. The Debian 12 / `bookworm` repository path in it is
-the one that matches `python:3.11-slim`; a `bullseye` path installs a driver
-that will not load.
+**This is destructive and it is not a dry run.** `load_azure.clear()` TRUNCATEs
+`filings` and DELETEs every lookup before inserting anything. A job that dies
+halfway leaves the database empty and the dashboard showing nothing. Recovery is
+proven and takes minutes rather than a restore — re-run the loader from this
+laptop with `.venv/bin/python -m src.etl.load_azure` — and the counts to compare
+against are the ones in this section: 850,321 / 43,573 / 123,990 / 8,570 / 63 / 4.
 
 ---
 
 ## 4c. Step 10 — the dashboard on Azure SQL
 
-**Status: code done and verified locally against Azure SQL. Image PENDING.**
+**Status: DONE.** Verified locally against Azure SQL, then built, pushed and
+deployed by CI on 2026-08-19. Live and serving.
 
 ```
 APP    = app.py                 unchanged layout, backend chosen by DB_BACKEND
@@ -1558,17 +1622,28 @@ one serving a cached first paint.
 | re-render, warm Streamlit cache | 0.1 s |
 | headline figures | `$142,146` median, 70,943 filings — identical to SQLite |
 
-### The 30-second cold-start budget is at risk
+### The 30-second cold-start budget — missed, by 2 seconds, once
 
 The plan's acceptance criterion is a cold start from zero replicas in under 30
-seconds. It cannot be confirmed without building the image, but the parts that
-are measurable do not leave much room:
+seconds. **Measured against the real image on 2026-08-20: 32 s** to a `200` from
+`/_stcore/health`, from a container app that had served nothing since the deploy
+hours earlier.
+
+**One observation, and it is not enough to act on.** A single timing cannot
+separate the image pull from the Python import from a serverless database
+resume, and 32 against a budget of 30 is inside the noise of any one of them.
+`deploy.yml` now records this number on every deployment (job summary, "Cold
+start: Ns") without failing on it, which is how the sample gets big enough to
+mean something. Revisit after a handful of deploys, not after this one.
+
+The parts measured before the image existed, for comparison:
 
 | component | measured |
 |---|---|
 | container cold start (placeholder image) | 24.4 s |
 | first page render against Azure | 13.6 s |
 | serverless resume, if the database is asleep | tens of seconds |
+| **whole cold start, real image, 2026-08-20** | **32 s** |
 
 **`salary_by_city` alone is 11.7 s of that 13.6 s.** Step 9 established there is
 no index fix — the indexes are used, and the cost is the query's shape: two
@@ -1586,19 +1661,24 @@ title was most filed. It looked correct because every test fixture holds one
 spelling per title. Matched case-folded now, with a fixture that has two
 spellings and a *different* title at index 0.
 
-### Deploying — PENDING
+### Deploying — DONE 2026-08-19, by CI
+
+No `docker build` was ever run on this machine. Step 11's `deploy.yml` built the
+image, pushed it, and rolled the deployment; revision `h1b-web--0000002` has been
+serving `ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:85851c5…` since
+2026-08-19 23:05 UTC, and the live URL answers `200` on both `/` and
+`/_stcore/health`.
+
+`webTargetPort` moves with `webImage`, always — 80 for the quickstart
+placeholder, 8501 for the real Streamlit image. A mismatch does not fail the
+deployment; it succeeds and serves nothing. That is why they are separate
+parameters with no defaults, and why `deploy.yml` passes both together.
+
+To deploy by hand instead of through CI — the fallback when the workflow is
+broken, and the path that also creates the role assignment CI skips:
 
 ```bash
-docker build -f Dockerfile.web -t ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest .
-docker push ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest
-```
-
-Then redeploy with the real image **and its port together** — `webTargetPort`
-must move from 80 to 8501 in the same deployment, which is why they are separate
-parameters with no defaults:
-
-```bash
-az deployment group create -g rg-h1b --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3   --template-file infra/main.bicep --parameters infra/main.parameters.json   --parameters webImage=ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest webTargetPort=8501
+az deployment group create -g rg-h1b --subscription 54d2e1cd-805a-4c5e-ac6f-25932378fcd3   --template-file infra/main.bicep --parameters infra/main.parameters.json   --parameters webImage=ghcr.io/justinrheydavid/h-1b-tech-salary-explore-web:latest webTargetPort=8501 etlImage=ghcr.io/justinrheydavid/h-1b-tech-salary-explore-etl:latest
 ```
 
 ### Both containers are configured by the template, not by hardcoded names
@@ -1667,10 +1747,13 @@ so it was taken from `gh repo view --json nameWithOwner` rather than typed.
 list` is **empty**. None of those three is sensitive: they are useless without
 the federated trust, and that trust names this repository and this branch.
 
-### Two manual steps remain — PENDING
+### The manual steps, and what they actually turned out to be — DONE 2026-08-19
 
-The service principal has no permissions yet. Granting them was refused as a
-privilege escalation, so it has to be run by hand:
+Two were predicted. One was needed, one was not, and a third appeared that
+nobody had planned for.
+
+**1. Grant the service principal Contributor on the resource group — needed.**
+Granting it was refused here as a privilege escalation, so it was run by hand:
 
 ```bash
 az role assignment create \
@@ -1685,27 +1768,86 @@ authenticates successfully and then fails on the deployment with an
 authorization error — the token exchange working is not the same as the
 principal being allowed to do anything.
 
-**2. Make both GHCR packages public, after the first push creates them.**
+**2. Make both GHCR packages public — NOT needed, and the claim was wrong.**
 
-repo → Packages → each package → Package settings → Change visibility → Public.
+This section used to state, in bold, that GHCR publishes packages private by
+default and that visibility had to be changed by hand after the first push.
+Observed after the first push:
 
-GHCR publishes packages **private by default**, and a private image cannot be
-pulled by Container Apps. The managed identity does not help here: GHCR does not
-accept Azure identities, only ACR does. The ARM deployment still *succeeds*,
-because it validates the image reference rather than fetching it, and the
-revision then fails asynchronously on authorization.
+```bash
+gh api "user/packages?package_type=container" --jq '.[] | "\(.name) \(.visibility)"'
+# h-1b-tech-salary-explore-web public
+# h-1b-tech-salary-explore-etl public
+```
 
-Keeping them private would mean a GHCR token in `registries.passwordSecretRef` —
-reintroducing exactly the secret this step exists to avoid. The images carry no
-data worth hiding: the ETL image downloads from Blob at runtime and the web
-image carries no database.
+Both `public`, with no intervention. A package pushed by `GITHUB_TOKEN` from a
+public repository is linked to that repository and takes its visibility. The
+prediction was stated more confidently than it was ever checked, which is the
+same failure this runbook keeps recording about code.
 
-`deploy.yml` checks the revision's `provisioningState` **before** waiting on
-health, and says this in the error if it fails. Without that check the health
-loop runs 60 attempts over 300 seconds and reports `never returned 200 from
-/_stcore/health` — a message about health when the cause is a pull, five minutes
-late and pointing at the wrong subsystem. The same misdiagnosis shape as
-retrying a permissions error as though it were a paused database.
+What survives the correction: a private image genuinely cannot be pulled by
+Container Apps, because GHCR does not accept Azure managed identities — only ACR
+does — and the ARM deployment succeeds anyway, since it validates the image
+reference rather than fetching it. So the revision fails asynchronously and the
+health loop reports a health problem five minutes late. `deploy.yml` checks the
+revision's `provisioningState` before waiting on health for that reason. Its
+error message no longer asserts a private package as the cause, because a
+startup crash lands in exactly the same state.
+
+**3. The role assignment CI cannot write — unplanned, and the reason for
+`assignRoles`.**
+
+The first deploy from `main` (run `32311438822`) got further than it looked. It
+built and pushed both images, authenticated, and deployed the container apps —
+revision `h1b-web--0000002` came up Provisioned and has been serving ever since.
+It then failed on the last module:
+
+```
+Authorization failed for template resource '787dc171-…' of type
+'Microsoft.Authorization/roleAssignments'. The client … with object id
+'3124dcef-…' does not have permission to perform action
+'Microsoft.Authorization/roleAssignments/write'
+```
+
+`roles.bicep` grants the ETL job Storage Blob Data Contributor. Writing a role
+assignment needs `Microsoft.Authorization/roleAssignments/write`, and
+**Contributor does not have it** — Contributor can create a storage account but
+not grant anyone access to it. That separation is deliberate in Azure: it is what
+stops a compromised deployment principal from escalating itself.
+
+Two ways out, and the choice matters more than it looks:
+
+| | |
+|---|---|
+| Grant the SP **Role Based Access Control Administrator** on `rg-h1b` | One command. Also means anyone who can push to `main` can grant themselves any role in this resource group. |
+| Add **`assignRoles`**, and have CI pass `false` | The principal stays Contributor. One resource is not converged by CI. |
+
+The second was taken. The deciding evidence: the assignment ARM was refused
+permission to write **already existed and was already correct** —
+`787dc171-…` is the ETL job's principal `7cb7a8f0-…` holding Storage Blob Data
+Contributor on `sth1bhutymqa65yoty`. CI was failing to rewrite a resource that
+was in the desired state, so nothing was being converged and nothing was lost by
+skipping it.
+
+`param assignRoles bool = true` **defaults to true**, which is the half that
+matters for Step 12. A stranger deploying into their own subscription runs the
+template as their own owner-level account and gets the grant. Only `deploy.yml`
+passes `false`. `tests/test_infra.py` pins both halves — the default and the
+flag — because either one drifting is silent.
+
+**The gap this leaves, stated rather than hidden:** delete and recreate the ETL
+job and its managed identity gets a new principal ID. CI will not grant the new
+one blob access, and the job will fail at runtime with
+`AuthorizationPermissionMismatch` — well after a deployment that reported
+success. The fix is one deployment by hand with `assignRoles=true` (the default),
+which is the same command in §4c above.
+
+**Not a manual step: the second role assignment on the storage account.** There
+are two Storage Blob Data Contributor assignments there and both belong. One is
+the ETL job. The other, `8ff2eb8b-…`, is the operator account — `az ad sp show`
+reports it does not exist, which is true and misleading, because it is a **User**,
+not a service principal. It is the Step 7 prerequisite grant recorded above.
+Do not delete it; without it this laptop cannot read or write the blobs.
 
 ### What each workflow does
 
@@ -1729,11 +1871,32 @@ deploys: Container Apps rolls a new revision when the image *reference* changes,
 so redeploying `:latest` over itself would leave the old revision serving and
 make "a commit to main rolls a new revision" quietly untrue.
 
+It passes `assignRoles=false` — the one resource this principal is not allowed to
+write. See "The manual steps" above for why that beats granting it the role, and
+for the gap it leaves.
+
+Before waiting on health it asks whether the revision **for this image** even
+provisioned. Selected by image rather than by newest-first: `[-1]` on
+`createdTime` returns the *previous* revision until the new one exists, and the
+previous one is already Provisioned, so the check would pass instantly without
+ever looking at what the run deployed.
+
 It then waits for `/_stcore/health` and **reports the cold start in the job
-summary** without failing on it. That is the plan's 30-second budget, measured
-at last — §4c predicted it would be missed, from 24.4 s of container start plus
-13.6 s of first render. A slow dashboard is a working dashboard, and failing the
-deploy would take away the fast fix, which is rolling back.
+summary** without failing on it. That is the plan's 30-second budget. §4c
+predicted it would be missed, from 24.4 s of container start plus 13.6 s of
+first render; the first real measurement was **32 s**, which misses it by two
+seconds and is one observation, not a finding. Reporting rather than enforcing is
+what lets the sample grow. A slow dashboard is a working dashboard, and failing
+the deploy would take away the fast fix, which is rolling back.
+
+The last step checks the app is serving its own document, and says plainly that
+this proves the ingress reaches our container and **not** that the database
+answered. No `curl` can prove the latter: Streamlit sends a static shell and
+streams every rendered value over a websocket, so the figures are never in the
+HTML. An earlier comment there claimed the step looked for "a figure that can
+only come from a real query against Azure SQL" — the code only ever checked the
+status line, and what it described is not possible over HTTP. `azure-tests.yml`
+is the workflow that actually queries.
 
 **`azure-tests.yml`** — on demand. `REQUIRE_AZURE=1 pytest -m azure`, which is
 the decision recorded in §8: the live tests must not be free to skip in the one
@@ -1763,6 +1926,13 @@ Renaming a constant would otherwise stop the template configuring the container
 — which then falls back to the hardcoded default and **works on this
 deployment**, surfacing only for the stranger redeploying in Step 12. Verified
 the test bites: renaming `blob._ACCOUNT_ENV` fails it.
+
+Two more tests pin the `assignRoles` split, because it is a place where the
+template and CI deliberately disagree and both halves are silent when wrong.
+One asserts `param assignRoles bool = true` — flip the default and the stranger's
+deploy skips the grant, and their ETL job fails at runtime long after the
+deployment reported success. The other asserts `deploy.yml` passes `false` —
+drop it and every push to `main` goes red. Verified both bite by flipping each.
 
 ---
 

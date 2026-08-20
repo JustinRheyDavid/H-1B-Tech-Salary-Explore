@@ -93,6 +93,22 @@ jobs:
       # the quickstart placeholder and 8501 for the real Streamlit image, and a
       # mismatch does not fail the deployment — it succeeds and serves nothing.
       # That is why they are separate parameters with no defaults.
+      #
+      # `assignRoles=false` skips the one resource this principal cannot write.
+      # Creating a role assignment needs `Microsoft.Authorization/roleAssignments/write`
+      # and this principal is Contributor, which does not have it — the first run
+      # of this workflow deployed everything else and then failed on exactly that
+      # resource. The alternative was to grant it Role Based Access Control
+      # Administrator, which would let anyone who can push to `main` grant
+      # themselves roles in this resource group. Skipping a resource that already
+      # exists and is already correct is the smaller cost. The parameter defaults
+      # to `true`, so a first deployment by a human owner still creates it.
+      #
+      # **The gap this leaves, stated rather than hidden:** if the ETL job is
+      # deleted and recreated, its principal ID changes and CI will not grant the
+      # new one blob access. The job then fails at runtime with
+      # AuthorizationPermissionMismatch. Fix: one deployment by hand without this
+      # flag. See runbook §4d.
       - name: Deploy infrastructure and roll the images
         id: apply
         run: |
@@ -105,42 +121,52 @@ jobs:
               webImage=${{ env.WEB_IMAGE }}:${{ github.sha }} \
               webTargetPort=8501 \
               etlImage=${{ env.ETL_IMAGE }}:${{ github.sha }} \
+              assignRoles=false \
             --query "properties.outputs.webAppFqdn.value" -o tsv > fqdn.txt
           echo "fqdn=$(cat fqdn.txt)" >> "$GITHUB_OUTPUT"
           echo "Deployed to https://$(cat fqdn.txt)"
 
       # Before waiting on health, ask whether the revision even started.
       #
-      # **The images are pulled from GHCR, which publishes packages private by
-      # default.** A private image cannot be pulled by Container Apps: the
-      # managed identity does not help, because GHCR does not accept Azure
-      # identities — only ACR does. The ARM deployment above still *succeeds*,
-      # because it validates the image reference rather than fetching it, and
-      # the revision then fails asynchronously on authorization.
+      # A revision that cannot pull its image fails asynchronously: the ARM
+      # deployment above still *succeeds*, because it validates the image
+      # reference rather than fetching it. Without this step the next one runs 60
+      # attempts over 300 seconds and reports "never returned 200 from
+      # /_stcore/health" — a message about health when the cause is a pull, which
+      # is the wrong subsystem and five minutes late. Same failure shape as
+      # retrying a permissions error as if it were a paused database.
       #
-      # Without this step the next one runs 60 attempts over 300 seconds and
-      # reports "never returned 200 from /_stcore/health" — a message about
-      # health when the cause is a pull, which is the wrong subsystem and five
-      # minutes late. Same failure shape as retrying a permissions error as if
-      # it were a paused database.
+      # **A correction to what this comment used to say.** It claimed GHCR
+      # publishes packages private by default and that making them public was a
+      # required manual step. Observed on the first run: both packages were
+      # created `public` with no intervention (`gh api user/packages
+      # --jq '.[] | "\(.name) \(.visibility)"'`). The guard below is still worth
+      # its ten lines — a failed pull is a real way to reach a Failed revision —
+      # but it is not the only one, so the error message no longer asserts a
+      # cause it cannot know.
       #
-      # Fix if this fires: make both packages public (repo → Packages → package
-      # settings → visibility). Keeping them private would require a GHCR token
-      # in `registries.passwordSecretRef`, which reintroduces exactly the secret
-      # this workflow exists to avoid.
+      # If a pull *is* the cause, the fix is to make the package public rather
+      # than to add a GHCR token in `registries.passwordSecretRef`, which would
+      # reintroduce exactly the secret this workflow exists to avoid.
       - name: Check the revision provisioned before blaming health
         run: |
           set -euo pipefail
+          expected="${{ env.WEB_IMAGE }}:${{ github.sha }}"
           for attempt in $(seq 1 30); do
+            # Selected by image, not by createdTime. `[-1]` on createdTime returns
+            # the PREVIOUS revision until the new one exists, and the previous one
+            # is Provisioned — so the check would pass instantly without ever
+            # looking at what this run deployed.
             state=$(az containerapp revision list -g rg-h1b -n h1b-web \
-              --query "sort_by([], &properties.createdTime)[-1].properties.provisioningState" -o tsv)
-            echo "revision provisioningState: ${state}"
+              --query "[?properties.template.containers[0].image=='${expected}'] | sort_by([], &properties.createdTime)[-1].properties.provisioningState" -o tsv)
+            echo "revision provisioningState for this image: ${state:-<not created yet>}"
             case "$state" in
               Provisioned) exit 0 ;;
               Failed)
-                echo "::error::The new revision failed to provision. If the images were"
-                echo "::error::just published, GHCR made them private and Container Apps"
-                echo "::error::cannot pull them. Make both packages public and re-run."
+                echo "::error::The new revision failed to provision — the deployment"
+                echo "::error::succeeded but the container never started. Check the system"
+                echo "::error::logs below; a pull failure (private GHCR package) and a"
+                echo "::error::crash on startup both land here and read differently."
                 az containerapp logs show -n h1b-web -g rg-h1b --type system --tail 30 || true
                 exit 1 ;;
             esac
@@ -177,16 +203,33 @@ jobs:
           echo "never returned 200 from $url"
           exit 1
 
-      # Health says the process is up; it does not say the database answered.
-      # This asks for the page itself and looks for a figure that can only come
-      # from a real query against Azure SQL.
-      - name: Check the page renders real data
+      # **What this proves, and what it does not.** It proves the ingress routes
+      # to our container and Streamlit serves its document — not the platform's
+      # error page, which also returns HTML.
+      #
+      # It does NOT prove the database answered, and no `curl` can. Streamlit
+      # sends a static shell and then streams every rendered value over a
+      # websocket, so the numbers this dashboard exists to show are never in the
+      # HTML. An earlier version of this comment claimed the step "looks for a
+      # figure that can only come from a real query against Azure SQL"; the code
+      # only ever checked the status line, and the check it described is not
+      # possible over HTTP.
+      #
+      # The live queries are covered by `azure-tests.yml`, which connects to
+      # Azure SQL directly with `REQUIRE_AZURE=1`. That is the workflow to run
+      # when the question is "did the data survive", not this one.
+      - name: Check the app itself is serving
         run: |
           set -euo pipefail
           url="https://${{ steps.apply.outputs.fqdn }}/"
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$url")
-          [ "$code" = "200" ] || { echo "page returned $code"; exit 1; }
-          echo "page served 200"
+          body=$(curl -sS --max-time 30 --fail-with-body "$url")
+          # Both markers verified against the live response, not guessed: the
+          # shell carries `<title>Streamlit</title>` and loads its bundle from
+          # `./static/js/`. Note the title is Streamlit's own, NOT the one
+          # `st.set_page_config` sets — that is applied in the browser.
+          grep -q '<title>Streamlit</title>' <<<"$body" && grep -q './static/js/' <<<"$body" \
+            || { echo "200, but the body is not the Streamlit app:"; head -c 500 <<<"$body"; exit 1; }
+          echo "the Streamlit document is being served"
 
       # Anything that got here and failed deserves the container's own account
       # of it rather than a curl exit code.
