@@ -1,6 +1,7 @@
 # The live tests, with skipping disabled.
 #
-# Plan Step 11, and the home of the decision recorded in runbook §8: the 16
+# Plan Step 11, and the home of the decision recorded in runbook §4 under
+# `REQUIRE_AZURE=1 — for CI, and only for CI`: the 16
 # Azure SQL tests and the 4 storage tests skip when the driver is missing,
 # nobody is logged in, or the resource is unreachable. That is right for a
 # contributor and wrong for a job whose entire purpose is to exercise Azure —
