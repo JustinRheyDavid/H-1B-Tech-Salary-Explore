@@ -1501,7 +1501,7 @@ server that it now raises in 1.5 s, and that a healthy connect is unaffected.
 `AZURE_SQL_SERVER` is waited on too. That is the accepted half of the trade —
 it ends in an error naming the SQLSTATE rather than in silence.
 
-### Building the image — DONE 2026-08-19. Running it in its container — PENDING.
+### Building the image — DONE 2026-08-19. Running it — one failed attempt so far.
 
 This machine has no container runtime — no Docker, no podman, no colima — so the
 image was never built here. Step 11's `deploy.yml` builds and pushes it on every
@@ -1510,20 +1510,58 @@ push to `main`, and `h1b-etl` is configured with
 be lowercase; the repository's own capitalization does not survive into the
 image name.
 
-**But `az containerapp job execution list -g rg-h1b -n h1b-etl` returns
-nothing.** The 850,321 rows in Azure SQL were loaded by
-`python -m src.etl.load_azure` on this laptop. The container has never run, which
-leaves all of this untested:
+### Run 1, 2026-08-20 — OOM-killed, and what it proved on the way
 
-- the msodbcsql18 install actually loading under `python:3.11-slim` — the
-  Debian 12 / `bookworm` repository path is the one that matches
-  `python:3.11-slim`; a `bullseye` path installs a driver that will not load
-- managed-identity blob access from inside the job: the identity, the role
-  assignment and `DefaultAzureCredential`'s chain, none of which resemble the
-  `az login` this laptop authenticates with
-- 850,321 rows through `fast_executemany` inside **2 GiB** of container memory,
-  against a laptop that had no such limit
-- `replicaRetryLimit: 1` outlasting a serverless database resume
+`h1b-etl-h0urc4s`, started 16:58:01 UTC, `Failed` at 16:59:40. Four things were
+untested before it; it settled three of them.
+
+**Passed, and these were the real unknowns.** The msodbcsql18 install loads under
+`python:3.11-slim` — the Debian 12 / `bookworm` repository path is the one that
+matches; a `bullseye` path installs a driver that will not load. Managed-identity
+blob access works from inside the job: the identity, the role assignment and
+`DefaultAzureCredential`'s chain, none of which resemble the `az login` this
+laptop authenticates with. All 9 caches downloaded in 74 s.
+
+**Failed: 850,321 rows do not fit in 2 GiB.** The last line the container logged
+was `downloaded 9 caches`; it died 25 s later, before `cleaned N filings`, which
+places it inside `read_cleaned`. Measured on this laptop over the same nine
+caches:
+
+| stage | RSS |
+|---|---|
+| 9 parquet frames in a list | 1.60 GB |
+| after `ingest.combine` — 1,347,103 rows | **2.33 GB** — past the 2.15 GB limit already |
+| after `clean.clean` — 850,321 rows | **3.09 GB** |
+
+The concat is the cliff: the frames list is still alive while pandas builds the
+combined copy, so the peak is roughly double what either holds alone.
+
+The job now asks for **2.0 CPU / 4 Gi** (Container Apps constrains the ratio to
+2 Gi per CPU, so the CPU moves whether the work needs it or not). Still $0 —
+consumption jobs bill against a monthly per-subscription free grant of 180,000
+vCPU-seconds and 360,000 GiB-seconds, and a five-minute run costs roughly 600
+and 1,200 of them.
+
+**The better fix, deliberately not taken yet:** cut the peak rather than raise
+the ceiling. Category dtypes for the 43,573 employers and 123,990 titles
+repeated across 850k rows would take a large bite out of 3.09 GB. Raising the
+limit is the one-line change that gets an end-to-end load proven before Step 12;
+the reduction belongs with the `salary_by_city` rewrite in a focused pass.
+
+**The database was never touched, and that is structural rather than lucky.**
+`run()` does all the reading, cleaning and table-building *before* it opens a
+connection, so `clear()` is unreachable until the expensive work has already
+succeeded. All six counts were unchanged after the failure: 850,321 / 43,573 /
+123,990 / 8,570 / 63 / 4.
+
+**No traceback survived.** The environment has no `appLogsConfiguration` — a Log
+Analytics workspace is billable past 5 GB/month and §8 rates that risk
+medium-high — so the console stream is all there is, it retains almost nothing,
+and it dies with the replica. `az containerapp job logs show` returned exactly
+one application line. Diagnosis came from the last line logged plus a local
+measurement, which worked here and will not always.
+
+### Running it
 
 Run it, and watch it rather than assuming:
 

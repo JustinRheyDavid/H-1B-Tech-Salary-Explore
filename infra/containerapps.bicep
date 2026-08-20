@@ -268,8 +268,35 @@ resource etlJob 'Microsoft.App/jobs@2024-03-01' = {
           image: etlImage
           env: etlEnvironment
           resources: {
-            cpu: json('1.0')
-            memory: '2Gi'
+            // 4 Gi because 2 Gi was measured to be too little, not guessed to
+            // be. The first run of this job in its container was OOM-killed
+            // 25 seconds after it finished downloading, inside
+            // `load_azure.read_cleaned`:
+            //
+            //   9 parquet frames in a list            1.60 GB
+            //   after ingest.combine (1,347,103 rows) 2.33 GB  <- over already
+            //   after clean.clean (850,321 rows)      3.09 GB
+            //
+            // The concat is the cliff: the frames list is still alive while
+            // pandas builds the combined copy, so the peak is roughly double
+            // what either holds alone.
+            //
+            // 4 Gi leaves about 1.2 GB of headroom over that peak. Cutting the
+            // peak instead — category dtypes for the 43,573 employers and
+            // 123,990 titles repeated across 850k rows — is the better fix and
+            // is deliberately not done here; this is the one-line change that
+            // gets an end-to-end load proven before Step 12.
+            //
+            // Container Apps constrains the ratio to 2 Gi per CPU, so 4 Gi
+            // requires 2.0 CPU whether the work is CPU-bound or not.
+            //
+            // **Still $0.** Consumption jobs bill per vCPU-second and
+            // GiB-second against a monthly per-subscription free grant
+            // (180,000 and 360,000 respectively). A five-minute run here costs
+            // roughly 600 vCPU-seconds and 1,200 GiB-seconds — under one
+            // percent of either. The $1 budget alarm remains the backstop.
+            cpu: json('2.0')
+            memory: '4Gi'
           }
         }
       ]
