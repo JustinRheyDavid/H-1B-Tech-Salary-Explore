@@ -79,6 +79,36 @@ def test_no_deployment_specific_name_is_hardcoded_in_the_template(bicep):
         )
 
 
+MAIN = BICEP.parent / "main.bicep"
+DEPLOY = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "deploy.yml"
+
+
+def test_the_role_assignment_defaults_to_being_created():
+    """`assignRoles` must default to true, or a stranger's deploy skips the grant.
+
+    CI passes `false` because its principal is Contributor and cannot write role
+    assignments. That is a concession to one caller, not the intended behaviour:
+    somebody deploying into their own subscription as their own owner runs the
+    template with no parameters and must get the ETL job's blob access. Drop the
+    default and their job fails at runtime with AuthorizationPermissionMismatch,
+    long after the deployment reported success.
+    """
+    main = MAIN.read_text()
+    assert re.search(r"param assignRoles bool = true\b", main), (
+        "assignRoles must exist and default to true in main.bicep"
+    )
+    assert "module roles 'roles.bicep' = if (assignRoles)" in main
+
+
+def test_ci_skips_the_role_assignment_it_cannot_write():
+    """The other half: without this, every push to main goes red.
+
+    Observed once already — run 32311438822 deployed the container app and then
+    failed on `Microsoft.Authorization/roleAssignments/write`.
+    """
+    assert "assignRoles=false" in DEPLOY.read_text()
+
+
 def test_the_home_ip_is_not_committed():
     """A home IP address does not belong in a public repository.
 
